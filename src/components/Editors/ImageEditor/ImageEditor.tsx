@@ -1,20 +1,14 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { 
-  Pen, 
-  Highlighter, 
-  Type, 
-  Square, 
-  Circle, 
-  ArrowRight, 
-  Eraser,
   RotateCw, 
-  Sliders, 
-  Undo2, 
   RotateCcw,
-  ZoomIn,
-  ZoomOut
+  FlipHorizontal, 
+  FlipVertical, 
+  Check, 
+  X,
+  Undo2
 } from 'lucide-react';
-import { AnnotationItem, AnnotationTool, DriveFile, Point } from '../../../types';
+import { DriveFile } from '../../../types';
 
 interface ImageEditorProps {
   file: DriveFile;
@@ -23,16 +17,14 @@ interface ImageEditorProps {
   onHasUnsavedChanges: (hasChanges: boolean) => void;
 }
 
-const COLOR_PRESETS = [
-  '#ef4444', // Red
-  '#3b82f6', // Blue
-  '#10b981', // Green
-  '#f59e0b', // Yellow / Orange
-  '#8b5cf6', // Purple
-  '#ec4899', // Pink
-  '#ffffff', // White
-  '#000000', // Black
-];
+type CropAspect = 'free' | '1:1' | '4:3' | '16:9' | '3:2' | '9:16';
+
+interface CropBox {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
 
 export const ImageEditor: React.FC<ImageEditorProps> = ({
   file,
@@ -40,147 +32,140 @@ export const ImageEditor: React.FC<ImageEditorProps> = ({
   onModify,
   onHasUnsavedChanges,
 }) => {
-  const [activeTool, setActiveTool] = useState<AnnotationTool>('draw');
-  const [selectedColor, setSelectedColor] = useState<string>('#ef4444');
-  const [strokeWidth, setStrokeWidth] = useState<number>(4);
-  const [rotation, setRotation] = useState<number>(0);
-  const [brightness, setBrightness] = useState<number>(100);
-  const [contrast, setContrast] = useState<number>(100);
-  const [scale, setScale] = useState<number>(1);
-  const [annotations, setAnnotations] = useState<AnnotationItem[]>([]);
-  const [isDrawing, setIsDrawing] = useState<boolean>(false);
-  const [textInputPos, setTextInputPos] = useState<Point | null>(null);
-  const [textInputValue, setTextInputValue] = useState<string>('');
+  // Image & History
   const [imgElement, setImgElement] = useState<HTMLImageElement | null>(null);
-  const [showAdjustments, setShowAdjustments] = useState<boolean>(false);
+  const [history, setHistory] = useState<HTMLImageElement[]>([]);
+  const [scale, setScale] = useState<number>(1);
 
+  // Rotation & Flip
+  const [rotation, setRotation] = useState<number>(0);
+  const [flipH, setFlipH] = useState<boolean>(false);
+  const [flipV, setFlipV] = useState<boolean>(false);
+
+  // Crop Box & State
+  const [cropAspect, setCropAspect] = useState<CropAspect>('free');
+  const [cropBox, setCropBox] = useState<CropBox | null>(null);
+  const [activeHandle, setActiveHandle] = useState<string | null>(null);
+
+  // Refs
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const currentPathRef = useRef<Point[]>([]);
-  const shapeStartRef = useRef<Point | null>(null);
-  const textInputRef = useRef<HTMLInputElement | null>(null);
+  const viewportRef = useRef<HTMLDivElement | null>(null);
+  const dragStartRef = useRef<{ mouseX: number; mouseY: number; box: CropBox } | null>(null);
 
-  // Load image element from ArrayBuffer
+  // Auto-fit image strictly inside viewport boundaries without any scrolling
+  const calculateFitScale = useCallback((img: HTMLImageElement, rot: number = rotation) => {
+    const viewport = viewportRef.current;
+    const isRotated = rot % 180 !== 0;
+    const imgW = isRotated ? (img.naturalHeight || 800) : (img.naturalWidth || 800);
+    const imgH = isRotated ? (img.naturalWidth || 600) : (img.naturalHeight || 600);
+
+    const padX = 32;
+    const padY = 32;
+    const availW = (viewport && viewport.clientWidth > 60) ? (viewport.clientWidth - padX) : (window.innerWidth - 300);
+    const availH = (viewport && viewport.clientHeight > 60) ? (viewport.clientHeight - padY) : (window.innerHeight - 200);
+
+    const scaleX = availW / imgW;
+    const scaleY = availH / imgH;
+    return Math.min(scaleX, scaleY, 1.0);
+  }, [rotation]);
+
+  // Load image element from ArrayBuffer / Blob
   useEffect(() => {
-    const blob = new Blob([arrayBuffer], { type: file.mimeType || 'image/png' });
+    let isCancelled = false;
+    const blob = file.rawBlob || new Blob([arrayBuffer], { type: file.mimeType || 'image/png' });
     const url = URL.createObjectURL(blob);
     const img = new Image();
-    img.crossOrigin = 'anonymous';
-    img.onload = () => {
-      setImgElement(img);
+
+    const handleLoaded = async () => {
+      try {
+        if ('decode' in img) {
+          await img.decode();
+        }
+      } catch (e) {}
+      if (!isCancelled) {
+        setImgElement(img);
+        setHistory([img]);
+        const fitScale = calculateFitScale(img, 0);
+        setScale(fitScale);
+
+        // Default crop box covers 90% of image centered
+        const w = img.naturalWidth || 800;
+        const h = img.naturalHeight || 600;
+        setCropBox({
+          x: Math.round(w * 0.05),
+          y: Math.round(h * 0.05),
+          width: Math.round(w * 0.9),
+          height: Math.round(h * 0.9),
+        });
+      }
+      URL.revokeObjectURL(url);
+    };
+
+    img.onload = handleLoaded;
+    img.onerror = (err) => {
+      console.error('Failed to load image:', err);
+      URL.revokeObjectURL(url);
     };
     img.src = url;
 
     return () => {
-      URL.revokeObjectURL(url);
+      isCancelled = true;
     };
-  }, [arrayBuffer, file.mimeType]);
+  }, [arrayBuffer, file.rawBlob, file.mimeType, calculateFitScale]);
 
-  // Main canvas render function (draws base image + filter adjustments + vector annotations)
+  // ResizeObserver & window resize listener to ensure zero scrolling at all times
+  useEffect(() => {
+    const handleResize = () => {
+      if (imgElement) {
+        setScale(calculateFitScale(imgElement, rotation));
+      }
+    };
+
+    window.addEventListener('resize', handleResize);
+    const viewport = viewportRef.current;
+    let observer: ResizeObserver | null = null;
+
+    if (viewport && typeof ResizeObserver !== 'undefined') {
+      observer = new ResizeObserver(() => handleResize());
+      observer.observe(viewport);
+    }
+
+    return () => {
+      window.removeEventListener('resize', handleResize);
+      if (observer) observer.disconnect();
+    };
+  }, [imgElement, rotation, calculateFitScale]);
+
+  // Render image to canvas
   const renderCanvas = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas || !imgElement) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    // Handle rotation dimensions
     const isRotated = rotation % 180 !== 0;
-    const originalWidth = imgElement.naturalWidth || 800;
-    const originalHeight = imgElement.naturalHeight || 600;
+    const origW = imgElement.naturalWidth || 800;
+    const origH = imgElement.naturalHeight || 600;
 
-    canvas.width = isRotated ? originalHeight : originalWidth;
-    canvas.height = isRotated ? originalWidth : originalHeight;
+    canvas.width = isRotated ? origH : origW;
+    canvas.height = isRotated ? origW : origH;
 
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    // Apply rotation & center transformations
     ctx.save();
     ctx.translate(canvas.width / 2, canvas.height / 2);
     ctx.rotate((rotation * Math.PI) / 180);
-    ctx.filter = `brightness(${brightness}%) contrast(${contrast}%)`;
-    ctx.drawImage(imgElement, -originalWidth / 2, -originalHeight / 2, originalWidth, originalHeight);
+    ctx.scale(flipH ? -1 : 1, flipV ? -1 : 1);
+    ctx.drawImage(imgElement, -origW / 2, -origH / 2, origW, origH);
     ctx.restore();
-
-    // Draw all annotation layers
-    annotations.forEach((item) => {
-      ctx.save();
-      ctx.strokeStyle = item.color;
-      ctx.fillStyle = item.color;
-      ctx.lineWidth = item.strokeWidth;
-      ctx.lineCap = 'round';
-      ctx.lineJoin = 'round';
-
-      if (item.type === 'highlight') {
-        ctx.globalAlpha = 0.35;
-        ctx.lineWidth = item.strokeWidth * 3.5;
-      } else {
-        ctx.globalAlpha = item.opacity || 1.0;
-      }
-
-      if ((item.type === 'draw' || item.type === 'highlight') && item.points && item.points.length > 1) {
-        ctx.beginPath();
-        ctx.moveTo(item.points[0].x, item.points[0].y);
-        for (let i = 1; i < item.points.length; i++) {
-          ctx.lineTo(item.points[i].x, item.points[i].y);
-        }
-        ctx.stroke();
-      } else if (item.type === 'rect' && item.startPoint && item.endPoint) {
-        const x = Math.min(item.startPoint.x, item.endPoint.x);
-        const y = Math.min(item.startPoint.y, item.endPoint.y);
-        const w = Math.abs(item.endPoint.x - item.startPoint.x);
-        const h = Math.abs(item.endPoint.y - item.startPoint.y);
-        ctx.strokeRect(x, y, w, h);
-      } else if (item.type === 'circle' && item.startPoint && item.endPoint) {
-        const x1 = item.startPoint.x;
-        const y1 = item.startPoint.y;
-        const x2 = item.endPoint.x;
-        const y2 = item.endPoint.y;
-        const rx = Math.abs(x2 - x1) / 2;
-        const ry = Math.abs(y2 - y1) / 2;
-        ctx.beginPath();
-        ctx.ellipse(Math.min(x1, x2) + rx, Math.min(y1, y2) + ry, rx, ry, 0, 0, 2 * Math.PI);
-        ctx.stroke();
-      } else if (item.type === 'arrow' && item.startPoint && item.endPoint) {
-        const { x: sx, y: sy } = item.startPoint;
-        const { x: ex, y: ey } = item.endPoint;
-
-        ctx.beginPath();
-        ctx.moveTo(sx, sy);
-        ctx.lineTo(ex, ey);
-        ctx.stroke();
-
-        const headlen = 16;
-        const angle = Math.atan2(ey - sy, ex - sx);
-        ctx.beginPath();
-        ctx.moveTo(ex, ey);
-        ctx.lineTo(ex - headlen * Math.cos(angle - Math.PI / 6), ey - headlen * Math.sin(angle - Math.PI / 6));
-        ctx.lineTo(ex - headlen * Math.cos(angle + Math.PI / 6), ey - headlen * Math.sin(angle + Math.PI / 6));
-        ctx.closePath();
-        ctx.fill();
-      } else if (item.type === 'text' && item.startPoint && item.text) {
-        // Draw crisp background tag for readable text
-        ctx.font = `bold ${item.fontSize || 18}px Inter, sans-serif`;
-        const textMetrics = ctx.measureText(item.text);
-        const textW = textMetrics.width;
-        const textH = item.fontSize || 18;
-
-        ctx.fillStyle = 'rgba(15, 23, 42, 0.75)';
-        ctx.roundRect(item.startPoint.x - 6, item.startPoint.y - textH - 4, textW + 12, textH + 10, 4);
-        ctx.fill();
-
-        ctx.fillStyle = item.color;
-        ctx.fillText(item.text, item.startPoint.x, item.startPoint.y);
-      }
-
-      ctx.restore();
-    });
-  }, [imgElement, rotation, brightness, contrast, annotations]);
+  }, [imgElement, rotation, flipH, flipV]);
 
   useEffect(() => {
     renderCanvas();
   }, [renderCanvas]);
 
-  // Export modified image to clean lossless PNG Blob
-  const exportImageBlob = (updatedAnnotations: AnnotationItem[] = annotations): Promise<Blob> => {
+  // Export modified image to Blob
+  const exportCanvasBlob = (): Promise<Blob> => {
     return new Promise((resolve) => {
       const canvas = canvasRef.current;
       if (!canvas) {
@@ -192,484 +177,466 @@ export const ImageEditor: React.FC<ImageEditorProps> = ({
     });
   };
 
-  const getCanvasCoordinates = (e: React.MouseEvent<HTMLCanvasElement>): Point => {
-    const canvas = canvasRef.current;
-    if (!canvas) return { x: 0, y: 0 };
-    const rect = canvas.getBoundingClientRect();
-    const scaleX = canvas.width / rect.width;
-    const scaleY = canvas.height / rect.height;
-
-    return {
-      x: (e.clientX - rect.left) * scaleX,
-      y: (e.clientY - rect.top) * scaleY,
-    };
-  };
-
-  const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    const pt = getCanvasCoordinates(e);
-
-    if (activeTool === 'eraser') {
-      eraseAnnotationAtPoint(pt);
-      setIsDrawing(true);
-      return;
+  // Rotate 90 degrees
+  const handleRotate = (deg: number = 90) => {
+    const newRot = (rotation + deg + 360) % 360;
+    setRotation(newRot);
+    if (imgElement) {
+      setScale(calculateFitScale(imgElement, newRot));
     }
-
-    if (activeTool === 'text') {
-      setTextInputPos(pt);
-      setTextInputValue('');
-      setTimeout(() => textInputRef.current?.focus(), 50);
-      return;
-    }
-
-    setIsDrawing(true);
-    shapeStartRef.current = pt;
-    currentPathRef.current = [pt];
-  };
-
-  const eraseAnnotationAtPoint = (pt: Point) => {
-    const updated = annotations.filter((ann) => {
-      if (ann.points && ann.points.length > 0) {
-        return !ann.points.some((p) => Math.hypot(p.x - pt.x, p.y - pt.y) < 20);
-      }
-      if (ann.startPoint && ann.endPoint) {
-        const minX = Math.min(ann.startPoint.x, ann.endPoint.x);
-        const maxX = Math.max(ann.startPoint.x, ann.endPoint.x);
-        const minY = Math.min(ann.startPoint.y, ann.endPoint.y);
-        const maxY = Math.max(ann.startPoint.y, ann.endPoint.y);
-        return !(pt.x >= minX - 12 && pt.x <= maxX + 12 && pt.y >= minY - 12 && pt.y <= maxY + 12);
-      }
-      if (ann.startPoint) {
-        return Math.hypot(ann.startPoint.x - pt.x, ann.startPoint.y - pt.y) > 30;
-      }
-      return true;
-    });
-
-    if (updated.length !== annotations.length) {
-      setAnnotations(updated);
-      onHasUnsavedChanges(true);
-      setTimeout(async () => {
-        const blob = await exportImageBlob(updated);
-        onModify(blob);
-      }, 50);
-    }
-  };
-
-  const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (!isDrawing) return;
-    const pt = getCanvasCoordinates(e);
-
-    if (activeTool === 'eraser') {
-      eraseAnnotationAtPoint(pt);
-      return;
-    }
-
-    if (activeTool === 'draw' || activeTool === 'highlight') {
-      currentPathRef.current.push(pt);
-      renderCanvas();
-
-      const canvas = canvasRef.current;
-      if (!canvas) return;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return;
-
-      ctx.save();
-      ctx.strokeStyle = selectedColor;
-      ctx.lineWidth = activeTool === 'highlight' ? strokeWidth * 3.5 : strokeWidth;
-      ctx.lineCap = 'round';
-      ctx.lineJoin = 'round';
-      ctx.globalAlpha = activeTool === 'highlight' ? 0.35 : 1.0;
-
-      const pts = currentPathRef.current;
-      if (pts.length > 1) {
-        ctx.beginPath();
-        ctx.moveTo(pts[0].x, pts[0].y);
-        for (let i = 1; i < pts.length; i++) {
-          ctx.lineTo(pts[i].x, pts[i].y);
-        }
-        ctx.stroke();
-      }
-      ctx.restore();
-    } else if (['rect', 'circle', 'arrow'].includes(activeTool)) {
-      renderCanvas();
-      const canvas = canvasRef.current;
-      if (!canvas || !shapeStartRef.current) return;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return;
-
-      const start = shapeStartRef.current;
-      ctx.save();
-      ctx.strokeStyle = selectedColor;
-      ctx.fillStyle = selectedColor;
-      ctx.lineWidth = strokeWidth;
-
-      if (activeTool === 'rect') {
-        const x = Math.min(start.x, pt.x);
-        const y = Math.min(start.y, pt.y);
-        const w = Math.abs(pt.x - start.x);
-        const h = Math.abs(pt.y - start.y);
-        ctx.strokeRect(x, y, w, h);
-      } else if (activeTool === 'circle') {
-        const rx = Math.abs(pt.x - start.x) / 2;
-        const ry = Math.abs(pt.y - start.y) / 2;
-        ctx.beginPath();
-        ctx.ellipse(Math.min(start.x, pt.x) + rx, Math.min(start.y, pt.y) + ry, rx, ry, 0, 0, 2 * Math.PI);
-        ctx.stroke();
-      } else if (activeTool === 'arrow') {
-        ctx.beginPath();
-        ctx.moveTo(start.x, start.y);
-        ctx.lineTo(pt.x, pt.y);
-        ctx.stroke();
-      }
-      ctx.restore();
-    }
-  };
-
-  const handleClearAll = () => {
-    setAnnotations([]);
-    onHasUnsavedChanges(true);
-    setTimeout(async () => {
-      const blob = await exportImageBlob([]);
-      onModify(blob);
-    }, 50);
-  };
-
-  const handleMouseUp = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (!isDrawing) return;
-    setIsDrawing(false);
-    const pt = getCanvasCoordinates(e);
-
-    const newAnnotation: AnnotationItem = {
-      id: 'img_ann_' + Date.now(),
-      type: activeTool,
-      pageIndex: 1,
-      color: selectedColor,
-      strokeWidth,
-    };
-
-    if (activeTool === 'draw' || activeTool === 'highlight') {
-      if (currentPathRef.current.length < 2) return;
-      newAnnotation.points = [...currentPathRef.current];
-    } else if (['rect', 'circle', 'arrow'].includes(activeTool)) {
-      if (!shapeStartRef.current) return;
-      newAnnotation.startPoint = shapeStartRef.current;
-      newAnnotation.endPoint = pt;
-    }
-
-    const updated = [...annotations, newAnnotation];
-    setAnnotations(updated);
     onHasUnsavedChanges(true);
 
     setTimeout(async () => {
-      const blob = await exportImageBlob(updated);
-      onModify(blob);
-    }, 50);
-  };
-
-  const handleCommitText = () => {
-    if (!textInputPos || !textInputValue.trim()) {
-      setTextInputPos(null);
-      return;
-    }
-
-    const newAnnotation: AnnotationItem = {
-      id: 'img_text_' + Date.now(),
-      type: 'text',
-      pageIndex: 1,
-      color: selectedColor,
-      strokeWidth: 1,
-      fontSize: 18,
-      startPoint: textInputPos,
-      text: textInputValue.trim(),
-    };
-
-    const updated = [...annotations, newAnnotation];
-    setAnnotations(updated);
-    setTextInputPos(null);
-    setTextInputValue('');
-    onHasUnsavedChanges(true);
-
-    setTimeout(async () => {
-      const blob = await exportImageBlob(updated);
-      onModify(blob);
-    }, 50);
-  };
-
-  const handleUndo = () => {
-    if (annotations.length === 0) return;
-    const updated = annotations.slice(0, -1);
-    setAnnotations(updated);
-    onHasUnsavedChanges(updated.length > 0);
-    setTimeout(async () => {
-      const blob = await exportImageBlob(updated);
-      onModify(blob);
-    }, 50);
-  };
-
-  const handleRotate = () => {
-    setRotation((r) => (r + 90) % 360);
-    onHasUnsavedChanges(true);
-    setTimeout(async () => {
-      const blob = await exportImageBlob();
+      const blob = await exportCanvasBlob();
       onModify(blob);
     }, 100);
   };
 
+  // Flip Horizontal
+  const handleFlipHorizontal = () => {
+    setFlipH((v) => !v);
+    onHasUnsavedChanges(true);
+    setTimeout(async () => {
+      const blob = await exportCanvasBlob();
+      onModify(blob);
+    }, 100);
+  };
+
+  // Flip Vertical
+  const handleFlipVertical = () => {
+    setFlipV((v) => !v);
+    onHasUnsavedChanges(true);
+    setTimeout(async () => {
+      const blob = await exportCanvasBlob();
+      onModify(blob);
+    }, 100);
+  };
+
+  // Apply Aspect Ratio Constraint to Crop Box
+  const handleSelectAspect = (aspect: CropAspect) => {
+    setCropAspect(aspect);
+    const canvas = canvasRef.current;
+    if (!canvas || !cropBox) return;
+
+    let ratio = 0;
+    if (aspect === '1:1') ratio = 1;
+    else if (aspect === '4:3') ratio = 4 / 3;
+    else if (aspect === '16:9') ratio = 16 / 9;
+    else if (aspect === '3:2') ratio = 3 / 2;
+    else if (aspect === '9:16') ratio = 9 / 16;
+
+    if (ratio > 0) {
+      let newW = cropBox.width;
+      let newH = Math.round(newW / ratio);
+
+      if (newH > canvas.height * 0.95) {
+        newH = Math.round(canvas.height * 0.9);
+        newW = Math.round(newH * ratio);
+      }
+
+      setCropBox({
+        x: Math.max(0, Math.round((canvas.width - newW) / 2)),
+        y: Math.max(0, Math.round((canvas.height - newH) / 2)),
+        width: Math.min(canvas.width, newW),
+        height: Math.min(canvas.height, newH),
+      });
+    }
+  };
+
+  // Execute Crop
+  const handleApplyCrop = () => {
+    const canvas = canvasRef.current;
+    if (!canvas || !cropBox || !imgElement) return;
+
+    const cropCanvas = document.createElement('canvas');
+    cropCanvas.width = Math.max(10, Math.round(cropBox.width));
+    cropCanvas.height = Math.max(10, Math.round(cropBox.height));
+    const cropCtx = cropCanvas.getContext('2d');
+    if (!cropCtx) return;
+
+    cropCtx.drawImage(
+      canvas,
+      Math.max(0, cropBox.x),
+      Math.max(0, cropBox.y),
+      cropBox.width,
+      cropBox.height,
+      0,
+      0,
+      cropBox.width,
+      cropBox.height
+    );
+
+    const croppedUrl = cropCanvas.toDataURL('image/png');
+    const newImg = new Image();
+    newImg.onload = () => {
+      setImgElement(newImg);
+      setHistory((prev) => [...prev, newImg]);
+      setRotation(0);
+      setFlipH(false);
+      setFlipV(false);
+
+      const fitScale = calculateFitScale(newImg, 0);
+      setScale(fitScale);
+
+      // Reset crop box for next crop operation
+      setCropBox({
+        x: Math.round(newImg.naturalWidth * 0.05),
+        y: Math.round(newImg.naturalHeight * 0.05),
+        width: Math.round(newImg.naturalWidth * 0.9),
+        height: Math.round(newImg.naturalHeight * 0.9),
+      });
+
+      cropCanvas.toBlob((blob) => {
+        if (blob) {
+          onModify(blob);
+          onHasUnsavedChanges(true);
+        }
+      }, 'image/png');
+    };
+    newImg.src = croppedUrl;
+  };
+
+  // Undo Last Crop
+  const handleUndoCrop = () => {
+    if (history.length <= 1) return;
+    const prevHistory = history.slice(0, -1);
+    const prevImg = prevHistory[prevHistory.length - 1];
+    setHistory(prevHistory);
+    setImgElement(prevImg);
+    setRotation(0);
+    setFlipH(false);
+    setFlipV(false);
+
+    const fitScale = calculateFitScale(prevImg, 0);
+    setScale(fitScale);
+
+    setCropBox({
+      x: Math.round(prevImg.naturalWidth * 0.05),
+      y: Math.round(prevImg.naturalHeight * 0.05),
+      width: Math.round(prevImg.naturalWidth * 0.9),
+      height: Math.round(prevImg.naturalHeight * 0.9),
+    });
+
+    onHasUnsavedChanges(prevHistory.length > 1);
+  };
+
+  // Reset Crop to Full Frame
+  const handleResetCrop = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    setCropBox({
+      x: 0,
+      y: 0,
+      width: canvas.width,
+      height: canvas.height,
+    });
+  };
+
+  // Mouse Interaction for Draggable Crop Handles & Move
+  const handleCropMouseDown = (e: React.MouseEvent, handle: string) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!cropBox) return;
+
+    setActiveHandle(handle);
+    dragStartRef.current = {
+      mouseX: e.clientX,
+      mouseY: e.clientY,
+      box: { ...cropBox },
+    };
+  };
+
+  const handleCropMouseMove = useCallback(
+    (e: MouseEvent) => {
+      if (!activeHandle || !dragStartRef.current || !canvasRef.current) return;
+
+      const canvas = canvasRef.current;
+      const rect = canvas.getBoundingClientRect();
+      const scaleFactor = canvas.width / rect.width;
+
+      const deltaX = (e.clientX - dragStartRef.current.mouseX) * scaleFactor;
+      const deltaY = (e.clientY - dragStartRef.current.mouseY) * scaleFactor;
+      const orig = dragStartRef.current.box;
+
+      let { x, y, width, height } = orig;
+      const minSize = 30;
+
+      if (activeHandle === 'move') {
+        x = Math.max(0, Math.min(canvas.width - width, orig.x + deltaX));
+        y = Math.max(0, Math.min(canvas.height - height, orig.y + deltaY));
+      } else if (activeHandle === 'nw') {
+        const newW = Math.max(minSize, orig.width - deltaX);
+        const newH = Math.max(minSize, orig.height - deltaY);
+        x = orig.x + (orig.width - newW);
+        y = orig.y + (orig.height - newH);
+        width = newW;
+        height = newH;
+      } else if (activeHandle === 'ne') {
+        width = Math.max(minSize, orig.width + deltaX);
+        const newH = Math.max(minSize, orig.height - deltaY);
+        y = orig.y + (orig.height - newH);
+        height = newH;
+      } else if (activeHandle === 'sw') {
+        const newW = Math.max(minSize, orig.width - deltaX);
+        x = orig.x + (orig.width - newW);
+        width = newW;
+        height = Math.max(minSize, orig.height + deltaY);
+      } else if (activeHandle === 'se') {
+        width = Math.max(minSize, orig.width + deltaX);
+        height = Math.max(minSize, orig.height + deltaY);
+      } else if (activeHandle === 'n') {
+        const newH = Math.max(minSize, orig.height - deltaY);
+        y = orig.y + (orig.height - newH);
+        height = newH;
+      } else if (activeHandle === 's') {
+        height = Math.max(minSize, orig.height + deltaY);
+      } else if (activeHandle === 'w') {
+        const newW = Math.max(minSize, orig.width - deltaX);
+        x = orig.x + (orig.width - newW);
+        width = newW;
+      } else if (activeHandle === 'e') {
+        width = Math.max(minSize, orig.width + deltaX);
+      }
+
+      // Constrain inside canvas
+      x = Math.max(0, Math.min(canvas.width - minSize, x));
+      y = Math.max(0, Math.min(canvas.height - minSize, y));
+      width = Math.min(canvas.width - x, width);
+      height = Math.min(canvas.height - y, height);
+
+      setCropBox({ x, y, width, height });
+    },
+    [activeHandle]
+  );
+
+  const handleCropMouseUp = useCallback(() => {
+    setActiveHandle(null);
+    dragStartRef.current = null;
+  }, []);
+
+  useEffect(() => {
+    if (activeHandle) {
+      window.addEventListener('mousemove', handleCropMouseMove);
+      window.addEventListener('mouseup', handleCropMouseUp);
+      return () => {
+        window.removeEventListener('mousemove', handleCropMouseMove);
+        window.removeEventListener('mouseup', handleCropMouseUp);
+      };
+    }
+  }, [activeHandle, handleCropMouseMove, handleCropMouseUp]);
+
+  const isRotated = rotation % 180 !== 0;
+  const naturalW = imgElement ? (isRotated ? (imgElement.naturalHeight || 800) : (imgElement.naturalWidth || 800)) : 800;
+  const naturalH = imgElement ? (isRotated ? (imgElement.naturalWidth || 600) : (imgElement.naturalHeight || 600)) : 600;
+
+  const displayWidth = Math.max(50, Math.round(naturalW * scale));
+  const displayHeight = Math.max(50, Math.round(naturalH * scale));
+
   return (
-    <div className="editor-container">
-      {/* Image Editor Toolbar */}
-      <div className="editor-toolbar">
+    <div className="editor-container" style={{ overflow: 'hidden' }}>
+      {/* Top Toolbar */}
+      <div className="editor-toolbar" style={{ justifyContent: 'space-between', gap: '0.75rem' }}>
+        {/* Aspect Ratio Presets */}
         <div className="toolbar-group">
-          <button
-            className={`tool-button ${activeTool === 'draw' ? 'active' : ''}`}
-            onClick={() => setActiveTool('draw')}
-            title="Pen / Freehand Markup"
-          >
-            <Pen size={16} />
-            <span>Draw</span>
-          </button>
-
-          <button
-            className={`tool-button ${activeTool === 'highlight' ? 'active' : ''}`}
-            onClick={() => setActiveTool('highlight')}
-            title="Highlighter"
-          >
-            <Highlighter size={16} />
-            <span>Highlight</span>
-          </button>
-
-          <button
-            className={`tool-button ${activeTool === 'arrow' ? 'active' : ''}`}
-            onClick={() => setActiveTool('arrow')}
-            title="Arrow Marker"
-          >
-            <ArrowRight size={16} />
-            <span>Arrow</span>
-          </button>
-
-          <button
-            className={`tool-button ${activeTool === 'text' ? 'active' : ''}`}
-            onClick={() => setActiveTool('text')}
-            title="Add Text Label"
-          >
-            <Type size={16} />
-            <span>Text</span>
-          </button>
-
-          <button
-            className={`tool-button ${activeTool === 'rect' ? 'active' : ''}`}
-            onClick={() => setActiveTool('rect')}
-            title="Rectangle Box"
-          >
-            <Square size={16} />
-          </button>
-
-          <button
-            className={`tool-button ${activeTool === 'circle' ? 'active' : ''}`}
-            onClick={() => setActiveTool('circle')}
-            title="Circle"
-          >
-            <Circle size={16} />
-          </button>
-
-          <button
-            className={`tool-button ${activeTool === 'eraser' ? 'active' : ''}`}
-            onClick={() => setActiveTool('eraser')}
-            title="Eraser (Click or drag across any line, arrow or note to erase)"
-          >
-            <Eraser size={16} />
-            <span>Eraser</span>
-          </button>
-        </div>
-
-        <div className="tool-divider" />
-
-        {/* Color Palette */}
-        <div className="toolbar-group">
-          <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
-            {COLOR_PRESETS.map((color) => (
+          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+            <span style={{ color: 'var(--text-secondary)', fontSize: '12px', fontWeight: 600, marginRight: '4px' }}>
+              Aspect:
+            </span>
+            {(['free', '1:1', '4:3', '16:9', '3:2', '9:16'] as CropAspect[]).map((aspect) => (
               <button
-                key={color}
-                onClick={() => setSelectedColor(color)}
-                style={{
-                  width: '20px',
-                  height: '20px',
-                  borderRadius: '50%',
-                  backgroundColor: color,
-                  border: selectedColor === color ? '2px solid #ffffff' : '1px solid rgba(255,255,255,0.2)',
-                  padding: 0,
-                }}
-              />
+                key={aspect}
+                onClick={() => handleSelectAspect(aspect)}
+                className={`tool-button ${cropAspect === aspect ? 'active' : ''}`}
+                style={{ padding: '3px 10px', fontSize: '12px', textTransform: 'capitalize' }}
+              >
+                {aspect}
+              </button>
             ))}
           </div>
 
-          <select
-            value={strokeWidth}
-            onChange={(e) => setStrokeWidth(parseInt(e.target.value, 10))}
-            style={{ padding: '2px 6px', fontSize: '12px', height: '28px' }}
-          >
-            <option value="2">2px</option>
-            <option value="4">4px</option>
-            <option value="8">8px</option>
-            <option value="14">14px</option>
-          </select>
-        </div>
+          <div className="tool-divider" />
 
-        <div className="tool-divider" />
-
-        {/* Rotate & Adjustments */}
-        <div className="toolbar-group">
-          <button className="tool-button" onClick={handleRotate} title="Rotate 90°">
+          {/* Rotate & Flip Tools */}
+          <button className="tool-button" onClick={() => handleRotate(-90)} title="Rotate Left 90°">
+            <RotateCcw size={16} />
+            <span>-90°</span>
+          </button>
+          <button className="tool-button" onClick={() => handleRotate(90)} title="Rotate Right 90°">
             <RotateCw size={16} />
-            <span>Rotate</span>
+            <span>+90°</span>
           </button>
-
           <button
-            className={`tool-button ${showAdjustments ? 'active' : ''}`}
-            onClick={() => setShowAdjustments((v) => !v)}
-            title="Brightness & Contrast"
+            className={`tool-button ${flipH ? 'active' : ''}`}
+            onClick={handleFlipHorizontal}
+            title="Flip Horizontal"
           >
-            <Sliders size={16} />
-            <span>Filters</span>
+            <FlipHorizontal size={16} />
+          </button>
+          <button
+            className={`tool-button ${flipV ? 'active' : ''}`}
+            onClick={handleFlipVertical}
+            title="Flip Vertical"
+          >
+            <FlipVertical size={16} />
           </button>
 
+          <div className="tool-divider" />
+
+          {/* Undo Crop */}
           <button
             className="tool-button"
-            onClick={handleUndo}
-            disabled={annotations.length === 0}
-            title="Undo"
+            onClick={handleUndoCrop}
+            disabled={history.length <= 1}
+            title="Undo Crop"
           >
             <Undo2 size={16} />
+            <span>Undo</span>
           </button>
 
+          {/* Reset Frame */}
           <button
             className="tool-button"
-            onClick={handleClearAll}
-            disabled={annotations.length === 0}
-            title="Clear All Annotations"
+            onClick={handleResetCrop}
+            title="Reset Crop Frame"
           >
-            <RotateCcw size={16} />
-            <span>Clear All</span>
+            <X size={16} />
+            <span>Reset Box</span>
           </button>
         </div>
 
-        {/* Zoom Controls */}
+        {/* Apply Crop Action Button */}
         <div className="toolbar-group" style={{ marginLeft: 'auto' }}>
-          <button className="tool-button" onClick={() => setScale((s) => Math.max(0.4, s - 0.15))}>
-            <ZoomOut size={16} />
-          </button>
-          <span style={{ fontSize: '12px', minWidth: '40px', textAlign: 'center', color: 'var(--text-secondary)' }}>
-            {Math.round(scale * 100)}%
-          </span>
-          <button className="tool-button" onClick={() => setScale((s) => Math.min(2.5, s + 0.15))}>
-            <ZoomIn size={16} />
+          <button
+            className="btn-primary"
+            onClick={handleApplyCrop}
+            style={{
+              padding: '5px 18px',
+              fontSize: '13px',
+              fontWeight: 600,
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+              background: '#2563eb',
+              borderRadius: '6px',
+              cursor: 'pointer',
+            }}
+          >
+            <Check size={16} />
+            <span>Apply Crop</span>
           </button>
         </div>
       </div>
 
-      {/* Adjustments Popup Panel */}
-      {showAdjustments && (
-        <div
-          style={{
-            background: 'var(--bg-secondary)',
-            borderBottom: '1px solid var(--border-subtle)',
-            padding: '0.6rem 1.25rem',
-            display: 'flex',
-            alignItems: 'center',
-            gap: '1.5rem',
-            fontSize: '13px',
-          }}
-        >
-          <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-            <span>Brightness: {brightness}%</span>
-            <input
-              type="range"
-              min="50"
-              max="150"
-              value={brightness}
-              onChange={(e) => {
-                setBrightness(parseInt(e.target.value, 10));
-                onHasUnsavedChanges(true);
-              }}
-            />
-          </label>
-
-          <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-            <span>Contrast: {contrast}%</span>
-            <input
-              type="range"
-              min="50"
-              max="150"
-              value={contrast}
-              onChange={(e) => {
-                setContrast(parseInt(e.target.value, 10));
-                onHasUnsavedChanges(true);
-              }}
-            />
-          </label>
-        </div>
-      )}
-
-      {/* Image Canvas Viewport */}
-      <div className="editor-viewport">
+      {/* Non-scrolling Image Canvas Viewport */}
+      <div
+        ref={viewportRef}
+        style={{
+          flex: 1,
+          width: '100%',
+          height: '100%',
+          display: 'flex',
+          justifyContent: 'center',
+          alignItems: 'center',
+          overflow: 'hidden',
+          padding: '1rem',
+          position: 'relative',
+          background: '#0d1117',
+          userSelect: 'none',
+        }}
+      >
         <div
           className="image-canvas-wrapper"
           style={{
-            transform: `scale(${scale})`,
-            transformOrigin: 'center center',
-            transition: 'transform 0.1s ease',
+            width: `${displayWidth}px`,
+            height: `${displayHeight}px`,
+            flexShrink: 0,
+            margin: 'auto',
+            position: 'relative',
+            boxShadow: '0 10px 30px rgba(0, 0, 0, 0.7)',
+            borderRadius: '6px',
+            overflow: 'visible',
+            transition: 'width 0.1s ease-out, height 0.1s ease-out',
           }}
         >
           <canvas
             ref={canvasRef}
-            style={{ cursor: activeTool === 'text' ? 'text' : 'crosshair', display: 'block' }}
-            onMouseDown={handleMouseDown}
-            onMouseMove={handleMouseMove}
-            onMouseUp={handleMouseUp}
+            style={{
+              width: '100%',
+              height: '100%',
+              display: 'block',
+              borderRadius: '6px',
+            }}
           />
 
-          {/* Text Input Overlay */}
-          {textInputPos && (
+          {/* Draggable Interactive Crop Frame Overlay */}
+          {cropBox && canvasRef.current && (
             <div
               style={{
                 position: 'absolute',
-                left: textInputPos.x,
-                top: textInputPos.y - 15,
-                zIndex: 30,
-                display: 'flex',
-                alignItems: 'center',
-                gap: '4px',
-                background: 'rgba(15, 23, 42, 0.9)',
-                padding: '4px 8px',
-                borderRadius: '6px',
-                border: '1px solid #3b82f6',
+                top: 0,
+                left: 0,
+                width: '100%',
+                height: '100%',
+                pointerEvents: 'none',
               }}
             >
-              <input
-                ref={textInputRef}
-                type="text"
-                value={textInputValue}
-                onChange={(e) => setTextInputValue(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') handleCommitText();
-                  if (e.key === 'Escape') setTextInputPos(null);
-                }}
-                placeholder="Enter text..."
+              {/* Active Crop Box */}
+              <div
                 style={{
-                  background: 'transparent',
-                  border: 'none',
-                  color: selectedColor,
-                  fontWeight: 600,
-                  fontSize: '14px',
-                  width: '180px',
+                  position: 'absolute',
+                  left: `${(cropBox.x / canvasRef.current.width) * 100}%`,
+                  top: `${(cropBox.y / canvasRef.current.height) * 100}%`,
+                  width: `${(cropBox.width / canvasRef.current.width) * 100}%`,
+                  height: `${(cropBox.height / canvasRef.current.height) * 100}%`,
+                  border: '2px solid #60a5fa',
+                  boxShadow: '0 0 0 9999px rgba(0, 0, 0, 0.55)',
+                  cursor: 'move',
+                  pointerEvents: 'all',
                 }}
-              />
-              <button
-                className="btn-primary"
-                style={{ padding: '2px 8px', fontSize: '12px' }}
-                onClick={handleCommitText}
+                onMouseDown={(e) => handleCropMouseDown(e, 'move')}
               >
-                Add
-              </button>
+                {/* Rule of Thirds Grid Lines */}
+                <div style={{ position: 'absolute', top: '33.33%', left: 0, width: '100%', height: '1px', background: 'rgba(255,255,255,0.4)', pointerEvents: 'none' }} />
+                <div style={{ position: 'absolute', top: '66.66%', left: 0, width: '100%', height: '1px', background: 'rgba(255,255,255,0.4)', pointerEvents: 'none' }} />
+                <div style={{ position: 'absolute', left: '33.33%', top: 0, width: '1px', height: '100%', background: 'rgba(255,255,255,0.4)', pointerEvents: 'none' }} />
+                <div style={{ position: 'absolute', left: '66.66%', top: 0, width: '1px', height: '100%', background: 'rgba(255,255,255,0.4)', pointerEvents: 'none' }} />
+
+                {/* 4 Corner Draggable Handles */}
+                <div
+                  style={{ position: 'absolute', top: '-6px', left: '-6px', width: '14px', height: '14px', borderTop: '3px solid #60a5fa', borderLeft: '3px solid #60a5fa', cursor: 'nw-resize' }}
+                  onMouseDown={(e) => handleCropMouseDown(e, 'nw')}
+                />
+                <div
+                  style={{ position: 'absolute', top: '-6px', right: '-6px', width: '14px', height: '14px', borderTop: '3px solid #60a5fa', borderRight: '3px solid #60a5fa', cursor: 'ne-resize' }}
+                  onMouseDown={(e) => handleCropMouseDown(e, 'ne')}
+                />
+                <div
+                  style={{ position: 'absolute', bottom: '-6px', left: '-6px', width: '14px', height: '14px', borderBottom: '3px solid #60a5fa', borderLeft: '3px solid #60a5fa', cursor: 'sw-resize' }}
+                  onMouseDown={(e) => handleCropMouseDown(e, 'sw')}
+                />
+                <div
+                  style={{ position: 'absolute', bottom: '-6px', right: '-6px', width: '14px', height: '14px', borderBottom: '3px solid #60a5fa', borderRight: '3px solid #60a5fa', cursor: 'se-resize' }}
+                  onMouseDown={(e) => handleCropMouseDown(e, 'se')}
+                />
+
+                {/* 4 Mid-Edge Draggable Handles */}
+                <div
+                  style={{ position: 'absolute', top: '-5px', left: '50%', transform: 'translateX(-50%)', width: '18px', height: '8px', background: '#60a5fa', borderRadius: '2px', cursor: 'n-resize' }}
+                  onMouseDown={(e) => handleCropMouseDown(e, 'n')}
+                />
+                <div
+                  style={{ position: 'absolute', bottom: '-5px', left: '50%', transform: 'translateX(-50%)', width: '18px', height: '8px', background: '#60a5fa', borderRadius: '2px', cursor: 's-resize' }}
+                  onMouseDown={(e) => handleCropMouseDown(e, 's')}
+                />
+                <div
+                  style={{ position: 'absolute', top: '50%', left: '-5px', transform: 'translateY(-50%)', width: '8px', height: '18px', background: '#60a5fa', borderRadius: '2px', cursor: 'w-resize' }}
+                  onMouseDown={(e) => handleCropMouseDown(e, 'w')}
+                />
+                <div
+                  style={{ position: 'absolute', top: '50%', right: '-5px', transform: 'translateY(-50%)', width: '8px', height: '18px', background: '#60a5fa', borderRadius: '2px', cursor: 'e-resize' }}
+                  onMouseDown={(e) => handleCropMouseDown(e, 'e')}
+                />
+              </div>
             </div>
           )}
         </div>

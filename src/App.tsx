@@ -130,7 +130,12 @@ export function App() {
             // If not found in cache and not a local file, fetch it
             if (!buffer && !meta.file.isLocal && !meta.file.id.startsWith('local_')) {
               try {
-                const res = await googleDriveService.downloadFile(meta.file.id, meta.file.mimeType);
+                const res = await googleDriveService.downloadFile(
+                  meta.file.id,
+                  meta.file.mimeType,
+                  undefined,
+                  meta.driveAccountId || meta.file.driveAccountId
+                );
                 buffer = res.data;
               } catch (e) {
                 console.warn(`Could not re-download ${meta.file.name}:`, e);
@@ -219,16 +224,19 @@ export function App() {
   // Find currently active document
   const activeDocument = openDocuments.find((d) => d.id === activeTabId) || null;
 
-  // Toast Helper
+  // Toast Helper with auto-deduplication
   const showToast = useCallback(
     (type: ToastNotification['type'], title: string, message?: string, duration: number = 4000) => {
-      const id = 'toast_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4);
-      const newToast: ToastNotification = { id, type, title, message, duration };
-      setToasts((prev) => [...prev, newToast]);
-
-      setTimeout(() => {
-        setToasts((prev) => prev.filter((t) => t.id !== id));
-      }, duration);
+      setToasts((prev) => {
+        const isDuplicate = prev.some((t) => t.title === title && t.message === message);
+        if (isDuplicate) return prev;
+        const id = 'toast_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4);
+        const newToast: ToastNotification = { id, type, title, message, duration };
+        setTimeout(() => {
+          setToasts((current) => current.filter((t) => t.id !== id));
+        }, duration);
+        return [...prev, newToast];
+      });
     },
     []
   );
@@ -515,12 +523,8 @@ export function App() {
         const { data } = await googleDriveService.downloadFile(
           file.id,
           file.mimeType,
-          (received, total) => {
-            const pct = Math.round((received / total) * 100);
-            const mbRec = (received / (1024 * 1024)).toFixed(1);
-            const mbTotal = (total / (1024 * 1024)).toFixed(1);
-            showToast('info', 'Downloading File', `${mbRec} MB / ${mbTotal} MB (${pct}%)`);
-          }
+          undefined,
+          file.driveAccountId || (activeAccountId !== 'local' ? activeAccountId || undefined : undefined)
         );
         buffer = data;
         initialBlob = new Blob([buffer], { type: file.mimeType });
@@ -838,7 +842,8 @@ export function App() {
           file.name,
           file.mimeType,
           modifiedBlob,
-          currentFolderId !== 'root' ? currentFolderId : undefined
+          currentFolderId !== 'root' ? currentFolderId : undefined,
+          activeAccountId !== 'local' ? activeAccountId || undefined : undefined
         );
       } else {
         // Direct media update to Google Drive
@@ -846,7 +851,8 @@ export function App() {
           file.id,
           file.name,
           file.mimeType,
-          modifiedBlob
+          modifiedBlob,
+          activeDocument.driveAccountId || file.driveAccountId
         );
       }
 
@@ -952,7 +958,8 @@ export function App() {
         copyName,
         file.mimeType,
         modifiedBlob,
-        currentFolderId !== 'root' ? currentFolderId : undefined
+        currentFolderId !== 'root' ? currentFolderId : undefined,
+        activeAccountId !== 'local' ? activeAccountId || undefined : undefined
       );
 
       setFiles((prev) => [created, ...prev]);
@@ -1152,13 +1159,21 @@ export function App() {
 
   // Copy File to Clipboard
   const handleCopyFile = (file: DriveFile) => {
-    setClipboard({ file, operation: 'copy' });
+    const fileWithAcc: DriveFile = {
+      ...file,
+      driveAccountId: file.driveAccountId || (activeAccountId !== 'local' ? activeAccountId || undefined : undefined),
+    };
+    setClipboard({ file: fileWithAcc, operation: 'copy' });
     showToast('info', `Copied "${file.name}"`, 'Navigate to any destination folder and click "Paste Here".');
   };
 
   // Cut File (Prepare for Move)
   const handleCutFile = (file: DriveFile) => {
-    setClipboard({ file, operation: 'cut' });
+    const fileWithAcc: DriveFile = {
+      ...file,
+      driveAccountId: file.driveAccountId || (activeAccountId !== 'local' ? activeAccountId || undefined : undefined),
+    };
+    setClipboard({ file: fileWithAcc, operation: 'cut' });
     showToast('info', `Cut "${file.name}"`, 'Navigate to destination folder and click "Paste Here" to move.');
   };
 
@@ -1182,10 +1197,80 @@ export function App() {
     if (file.isLocal || file.id.startsWith('local_')) {
       throw new Error('Local file binary data is not available.');
     }
-    // Download binary from Google Drive
-    const { data } = await googleDriveService.downloadFile(file.id, file.mimeType);
+    // Download binary from source Google Drive account
+    const { data } = await googleDriveService.downloadFile(file.id, file.mimeType, undefined, file.driveAccountId);
     const blob = new Blob([data], { type: file.mimeType || 'application/octet-stream' });
     return { blob, buffer: data };
+  };
+
+  // Recursively copy a folder and all its contents across drives or locally
+  const copyFolderRecursively = async (
+    srcFolder: DriveFile,
+    targetFolderId: string,
+    targetAccountId?: string,
+    targetIsLocal?: boolean
+  ): Promise<DriveFile> => {
+    // 1. Create the destination folder
+    let createdFolder: DriveFile;
+    if (!targetIsLocal) {
+      createdFolder = await googleDriveService.createFolder(
+        srcFolder.name,
+        targetFolderId !== 'root' ? targetFolderId : undefined,
+        targetAccountId
+      );
+    } else {
+      createdFolder = {
+        id: 'local_folder_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+        name: srcFolder.name,
+        mimeType: 'application/vnd.google-apps.folder',
+        fileType: 'unknown',
+        isFolder: true,
+        isLocal: true,
+        parentFolderId: targetFolderId,
+        modifiedTime: new Date().toISOString(),
+      };
+      setFiles((prev) => [createdFolder, ...prev]);
+    }
+
+    // 2. Fetch children from source
+    let children: DriveFile[] = [];
+    if (!srcFolder.isLocal && !srcFolder.id.startsWith('local_')) {
+      children = await googleDriveService.listFiles(srcFolder.id, undefined, srcFolder.driveAccountId);
+    } else {
+      children = files.filter((f) => f.parentFolderId === srcFolder.id);
+    }
+
+    // 3. Copy children recursively
+    for (const child of children) {
+      const childIsFolder = child.isFolder || child.mimeType === 'application/vnd.google-apps.folder';
+      if (childIsFolder) {
+        await copyFolderRecursively(child, createdFolder.id, targetAccountId, targetIsLocal);
+      } else {
+        const { blob, buffer } = await getFileBinary(child);
+        if (!targetIsLocal) {
+          await googleDriveService.createNewFile(
+            child.name,
+            child.mimeType,
+            blob,
+            createdFolder.id,
+            targetAccountId
+          );
+        } else {
+          const localChild: DriveFile = {
+            ...child,
+            id: 'local_file_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+            name: child.name,
+            isLocal: true,
+            parentFolderId: createdFolder.id,
+            rawBlob: blob,
+            rawArrayBuffer: buffer,
+          };
+          setFiles((prev) => [localChild, ...prev]);
+        }
+      }
+    }
+
+    return createdFolder;
   };
 
   // Universal Paste File into Current Folder (Local, Drive 1, Drive 2, Cross-Drive)
@@ -1195,6 +1280,7 @@ export function App() {
     setIsLoading(true);
     try {
       const srcFile = clipboard.file;
+      const isFolder = srcFile.isFolder || srcFile.mimeType === 'application/vnd.google-apps.folder';
       const isSrcLocal = srcFile.isLocal || srcFile.id.startsWith('local_');
       const isDestLocal = !isConnectedToDrive || activeAccountId === 'local';
       const isSameDriveAccount =
@@ -1202,23 +1288,35 @@ export function App() {
         !isDestLocal &&
         (srcFile.driveAccountId === activeAccountId || (!srcFile.driveAccountId && !activeAccountId));
 
+      const targetAccountId = activeAccountId !== 'local' ? activeAccountId || undefined : undefined;
+
       if (clipboard.operation === 'copy') {
-        if (isSameDriveAccount) {
-          // Native same-drive copy
+        if (isFolder) {
+          // Folder copy (requires recursive folder & file copy)
+          showToast('info', 'Copying Folder...', `Copying "${srcFile.name}" and all contents...`);
+          const createdFolder = await copyFolderRecursively(srcFile, currentFolderId, targetAccountId, isDestLocal);
+          if (!isDestLocal) {
+            setFiles((prev) => [createdFolder, ...prev]);
+          }
+          showToast('success', 'Folder Copied!', `Pasted "${createdFolder.name}" into this folder.`);
+        } else if (isSameDriveAccount) {
+          // Native same-drive file copy
           const copied = await googleDriveService.copyFile(
             srcFile.id,
-            currentFolderId !== 'root' ? currentFolderId : undefined
+            currentFolderId !== 'root' ? currentFolderId : undefined,
+            targetAccountId
           );
           setFiles((prev) => [copied, ...prev]);
           showToast('success', 'File Copied in Drive!', `Pasted "${copied.name}" into this folder.`);
         } else if (!isDestLocal) {
-          // Cross-Drive or Local-to-Drive: upload binary directly to current Google Drive
+          // Cross-Drive or Local-to-Drive: upload binary directly to destination Google Drive account
           const { blob } = await getFileBinary(srcFile);
           const uploaded = await googleDriveService.createNewFile(
             srcFile.name,
             srcFile.mimeType,
             blob,
-            currentFolderId !== 'root' ? currentFolderId : undefined
+            currentFolderId !== 'root' ? currentFolderId : undefined,
+            targetAccountId
           );
           setFiles((prev) => [uploaded, ...prev]);
           showToast('success', 'Pasted into Google Drive!', `Uploaded "${uploaded.name}" into this Drive folder.`);
@@ -1240,35 +1338,57 @@ export function App() {
         }
       } else if (clipboard.operation === 'cut') {
         if (isSameDriveAccount) {
-          // Native same-drive move
+          // Native same-drive move (Google Drive natively supports moving folders and files)
           const moved = await googleDriveService.moveFile(
             srcFile.id,
             srcFile.parentFolderId,
-            currentFolderId !== 'root' ? currentFolderId : undefined
+            currentFolderId !== 'root' ? currentFolderId : undefined,
+            targetAccountId
           );
           setFiles((prev) => [moved, ...prev.filter((f) => f.id !== srcFile.id)]);
-          showToast('success', 'File Moved in Drive!', `Moved "${moved.name}" into this folder.`);
+          showToast('success', isFolder ? 'Folder Moved in Drive!' : 'File Moved in Drive!', `Moved "${moved.name}" into this folder.`);
+        } else if (isFolder) {
+          // Cross-Drive or Local-to-Drive folder move
+          showToast('info', 'Moving Folder...', `Moving "${srcFile.name}" and all contents...`);
+          const createdFolder = await copyFolderRecursively(srcFile, currentFolderId, targetAccountId, isDestLocal);
+          // Delete original from source account
+          if (isSrcLocal) {
+            setFiles((prev) => prev.filter((f) => f.id !== srcFile.id && f.parentFolderId !== srcFile.id));
+          } else {
+            try {
+              await googleDriveService.deleteFile(srcFile.id, srcFile.driveAccountId);
+            } catch (e) {
+              console.warn('Could not delete original folder from source drive:', e);
+            }
+          }
+          if (!isDestLocal) {
+            setFiles((prev) => [createdFolder, ...prev.filter((f) => f.id !== srcFile.id)]);
+          }
+          showToast('success', 'Folder Moved!', `Moved "${createdFolder.name}" into this Drive folder.`);
         } else if (!isDestLocal) {
-          // Move from Local / Drive 1 into Drive 2
+          // Move file from Local / Drive 1 into Drive 2/3
           const { blob } = await getFileBinary(srcFile);
           const uploaded = await googleDriveService.createNewFile(
             srcFile.name,
             srcFile.mimeType,
             blob,
-            currentFolderId !== 'root' ? currentFolderId : undefined
+            currentFolderId !== 'root' ? currentFolderId : undefined,
+            targetAccountId
           );
-          // Delete original from source
+          // Delete original from source account
           if (isSrcLocal) {
             setFiles((prev) => prev.filter((f) => f.id !== srcFile.id));
           } else {
             try {
-              await googleDriveService.deleteFile(srcFile.id);
-            } catch (e) {}
+              await googleDriveService.deleteFile(srcFile.id, srcFile.driveAccountId);
+            } catch (e) {
+              console.warn('Could not delete file from source drive:', e);
+            }
           }
           setFiles((prev) => [uploaded, ...prev.filter((f) => f.id !== srcFile.id)]);
           showToast('success', 'File Moved to Google Drive!', `Moved "${uploaded.name}" into this Drive.`);
         } else {
-          // Move from Google Drive into Local Drive
+          // Move file from Google Drive into Local Drive
           const { blob, buffer } = await getFileBinary(srcFile);
           const movedLocal: DriveFile = {
             ...srcFile,
@@ -1280,8 +1400,10 @@ export function App() {
           };
           if (!isSrcLocal) {
             try {
-              await googleDriveService.deleteFile(srcFile.id);
-            } catch (e) {}
+              await googleDriveService.deleteFile(srcFile.id, srcFile.driveAccountId);
+            } catch (e) {
+              console.warn('Could not delete file from source drive:', e);
+            }
           }
           setFiles((prev) => [movedLocal, ...prev.filter((f) => f.id !== srcFile.id)]);
           showToast('success', 'File Moved Locally!', `Moved "${movedLocal.name}" into this folder.`);
@@ -1305,7 +1427,7 @@ export function App() {
     setIsLoading(true);
     try {
       if (googleDriveService.isConnected() && !file.isLocal) {
-        await googleDriveService.deleteFile(file.id);
+        await googleDriveService.deleteFile(file.id, file.driveAccountId);
         setFiles((prev) => prev.filter((f) => f.id !== file.id));
         showToast('success', 'Deleted in Google Drive', `"${file.name}" was deleted.`);
       } else {

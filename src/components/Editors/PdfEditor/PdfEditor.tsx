@@ -1467,7 +1467,7 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
         // 4. Try re-downloading from Google Drive if remote file
         if (!rawData && !file.isLocal && !file.id.startsWith('local_')) {
           try {
-            const { data } = await googleDriveService.downloadFile(file.id, file.mimeType);
+            const { data } = await googleDriveService.downloadFile(file.id, file.mimeType, undefined, file.driveAccountId);
             if (data && data.byteLength > 0) {
               rawData = new Uint8Array(data);
             }

@@ -4,7 +4,7 @@
  * and supports Offline Saving with Auto-Sync when reconnected.
  */
 
-const DB_NAME = 'ResourceReader_BinaryCache_v2';
+const DB_NAME = 'ResourceReader_BinaryCache_v3';
 const STORE_BUFFERS = 'file_buffers';
 const STORE_OFFLINE_SYNC = 'offline_pending_sync';
 
@@ -22,7 +22,7 @@ export interface PendingOfflineSyncItem {
 
 function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DB_NAME, 2);
+    const request = indexedDB.open(DB_NAME, 3);
     request.onupgradeneeded = () => {
       const db = request.result;
       if (!db.objectStoreNames.contains(STORE_BUFFERS)) {
