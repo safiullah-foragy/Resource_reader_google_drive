@@ -1627,12 +1627,30 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
     setScale(Math.round(targetScale * 100) / 100);
   }, [defaultDimensions.height]);
 
-  // Single-Click Press & Hold Drag-to-Scroll (Hand Grab Scrolling)
-  const panDragRef = useRef<{ clientY: number; scrollTop: number; isDragging: boolean }>({
+  // Single-Click Press & Hold Drag-to-Scroll with Kinetic Inertia
+  const panDragRef = useRef<{
+    clientY: number;
+    scrollTop: number;
+    isDragging: boolean;
+    lastY: number;
+    lastTime: number;
+    velocity: number;
+  }>({
     clientY: 0,
     scrollTop: 0,
     isDragging: false,
+    lastY: 0,
+    lastTime: 0,
+    velocity: 0,
   });
+  const inertiaRafRef = useRef<number | null>(null);
+
+  const stopInertia = useCallback(() => {
+    if (inertiaRafRef.current) {
+      cancelAnimationFrame(inertiaRafRef.current);
+      inertiaRafRef.current = null;
+    }
+  }, []);
 
   const handleStartDragScroll = useCallback((e: React.MouseEvent) => {
     // If double click or multi click (e.detail >= 2), cancel drag and prevent native browser word selection / scroll
@@ -1643,35 +1661,79 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
       return;
     }
     if (!scrollContainerRef.current) return;
+    stopInertia();
+    const now = performance.now();
     panDragRef.current = {
       clientY: e.clientY,
       scrollTop: scrollContainerRef.current.scrollTop,
       isDragging: true,
+      lastY: e.clientY,
+      lastTime: now,
+      velocity: 0,
     };
-  }, []);
+  }, [stopInertia]);
 
   const handleMoveDragScroll = useCallback((e: React.MouseEvent) => {
     if (panDragRef.current.isDragging && scrollContainerRef.current) {
+      const now = performance.now();
+      const dt = Math.max(1, now - panDragRef.current.lastTime);
+      const instantVelocity = (panDragRef.current.lastY - e.clientY) / dt;
+      panDragRef.current.velocity = panDragRef.current.velocity * 0.4 + instantVelocity * 0.6;
+      panDragRef.current.lastY = e.clientY;
+      panDragRef.current.lastTime = now;
+
       const deltaY = e.clientY - panDragRef.current.clientY;
       scrollContainerRef.current.scrollTop = panDragRef.current.scrollTop - deltaY * scrollSpeed;
     }
   }, [scrollSpeed]);
 
   const handleEndDragScroll = useCallback(() => {
+    if (!panDragRef.current.isDragging) return;
     panDragRef.current.isDragging = false;
-  }, []);
 
-  // Global window listeners for single-click drag scrolling
+    const now = performance.now();
+    const wasMoving = now - panDragRef.current.lastTime < 90;
+    const velocity = wasMoving ? panDragRef.current.velocity : 0;
+
+    if (Math.abs(velocity) > 0.04 && scrollContainerRef.current) {
+      let v = velocity * scrollSpeed * 14;
+      const friction = 0.94;
+
+      const applyInertia = () => {
+        if (!scrollContainerRef.current || Math.abs(v) < 0.25) {
+          inertiaRafRef.current = null;
+          return;
+        }
+        scrollContainerRef.current.scrollTop += v;
+        v *= friction;
+        inertiaRafRef.current = requestAnimationFrame(applyInertia);
+      };
+
+      stopInertia();
+      inertiaRafRef.current = requestAnimationFrame(applyInertia);
+    }
+  }, [scrollSpeed, stopInertia]);
+
+  // Global window listeners for single-click drag scrolling and inertia
   useEffect(() => {
     const handleGlobalMouseMove = (e: MouseEvent) => {
       if (panDragRef.current.isDragging && scrollContainerRef.current) {
+        const now = performance.now();
+        const dt = Math.max(1, now - panDragRef.current.lastTime);
+        const instantVelocity = (panDragRef.current.lastY - e.clientY) / dt;
+        panDragRef.current.velocity = panDragRef.current.velocity * 0.4 + instantVelocity * 0.6;
+        panDragRef.current.lastY = e.clientY;
+        panDragRef.current.lastTime = now;
+
         const deltaY = e.clientY - panDragRef.current.clientY;
         scrollContainerRef.current.scrollTop = panDragRef.current.scrollTop - deltaY * scrollSpeed;
       }
     };
 
     const handleGlobalMouseUp = () => {
-      panDragRef.current.isDragging = false;
+      if (panDragRef.current.isDragging) {
+        handleEndDragScroll();
+      }
     };
 
     window.addEventListener('mousemove', handleGlobalMouseMove);
@@ -1680,8 +1742,9 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
     return () => {
       window.removeEventListener('mousemove', handleGlobalMouseMove);
       window.removeEventListener('mouseup', handleGlobalMouseUp);
+      stopInertia();
     };
-  }, [scrollSpeed]);
+  }, [scrollSpeed, handleEndDragScroll, stopInertia]);
 
   // Compile annotations into valid PDF binary across all pages
   const exportModifiedPdf = async (updatedAnnotations: AnnotationItem[]): Promise<Blob> => {
