@@ -8,6 +8,7 @@ import {
   savePersistedDirectoryHandle,
   readFilesFromDirectoryHandle,
 } from './services/localDirectoryService';
+import { fileBufferCache } from './services/fileBufferCache';
 
 import { TabBar } from './components/Header/TabBar';
 import { Header } from './components/Header/Header';
@@ -47,9 +48,11 @@ export function App() {
   });
   const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
 
-  // Multi-Document Tabs State
+  // Multi-Document Tabs State (Persisted across page refreshes)
   const [openDocuments, setOpenDocuments] = useState<OpenDocument[]>([]);
-  const [activeTabId, setActiveTabId] = useState<string>('explorer'); // 'explorer' or document id
+  const [activeTabId, setActiveTabId] = useState<string>(() => {
+    return localStorage.getItem('studio_active_tab_id_v1') || 'explorer';
+  });
 
   // Unsaved changes confirmation modal state
   type PendingLeaveAction =
@@ -59,7 +62,108 @@ export function App() {
 
   const [pendingLeaveAction, setPendingLeaveAction] = useState<PendingLeaveAction | null>(null);
   const [isUnsavedModalSaving, setIsUnsavedModalSaving] = useState<boolean>(false);
-  const [isHeaderCollapsed, setIsHeaderCollapsed] = useState<boolean>(false);
+  const [isHeaderCollapsed, setIsHeaderCollapsed] = useState<boolean>(() => {
+    return localStorage.getItem('studio_is_header_collapsed_v1') === 'true';
+  });
+
+  // Persist open tabs and active document to localStorage
+  useEffect(() => {
+    if (openDocuments.length > 0) {
+      const metaToSave = openDocuments.map((d) => ({
+        id: d.id,
+        file: {
+          id: d.file.id,
+          name: d.file.name,
+          mimeType: d.file.mimeType,
+          size: d.file.size,
+          modifiedTime: d.file.modifiedTime,
+          fileType: d.file.fileType,
+          iconUrl: d.file.iconUrl,
+          thumbnailLink: d.file.thumbnailLink,
+          isLocal: d.file.isLocal,
+          isFolder: d.file.isFolder,
+          isDemo: d.file.isDemo,
+          driveAccountId: d.file.driveAccountId,
+        },
+        driveAccountId: d.driveAccountId,
+      }));
+      localStorage.setItem('studio_open_docs_meta_v1', JSON.stringify(metaToSave));
+    } else {
+      localStorage.removeItem('studio_open_docs_meta_v1');
+    }
+    localStorage.setItem('studio_active_tab_id_v1', activeTabId);
+  }, [openDocuments, activeTabId]);
+
+  // Persist header collapse focus mode
+  useEffect(() => {
+    localStorage.setItem('studio_is_header_collapsed_v1', isHeaderCollapsed ? 'true' : 'false');
+  }, [isHeaderCollapsed]);
+
+  // Auto-Restore All Open Tabs and Active State on Page Refresh
+  useEffect(() => {
+    let isCancelled = false;
+
+    const restoreSessionTabs = async () => {
+      const savedMeta = localStorage.getItem('studio_open_docs_meta_v1');
+      if (!savedMeta) return;
+
+      try {
+        const metaList: Array<{ id: string; file: DriveFile; driveAccountId?: string }> = JSON.parse(savedMeta);
+        if (!Array.isArray(metaList) || metaList.length === 0) return;
+
+        const restored: OpenDocument[] = [];
+
+        for (const meta of metaList) {
+          if (isCancelled) return;
+          try {
+            let buffer = await fileBufferCache.get(meta.file.id);
+
+            // If not found in cache and not a local file, fetch it
+            if (!buffer && !meta.file.isLocal && !meta.file.id.startsWith('local_')) {
+              try {
+                const res = await googleDriveService.downloadFile(meta.file.id, meta.file.mimeType);
+                buffer = res.data;
+              } catch (e) {
+                console.warn(`Could not re-download ${meta.file.name}:`, e);
+              }
+            }
+
+            if (buffer && buffer.byteLength > 0) {
+              const blob = new Blob([buffer], { type: meta.file.mimeType });
+              restored.push({
+                id: meta.id,
+                file: { ...meta.file, rawBlob: blob, rawArrayBuffer: buffer },
+                arrayBuffer: buffer,
+                modifiedBlob: blob,
+                hasUnsavedChanges: false,
+                saveStatus: 'idle',
+                driveAccountId: meta.driveAccountId,
+              });
+            }
+          } catch (err) {
+            console.warn(`Could not restore tab ${meta.file.name}:`, err);
+          }
+        }
+
+        if (!isCancelled && restored.length > 0) {
+          setOpenDocuments(restored);
+          const savedActive = localStorage.getItem('studio_active_tab_id_v1');
+          if (savedActive && (savedActive === 'explorer' || restored.some((d) => d.id === savedActive))) {
+            setActiveTabId(savedActive);
+          } else {
+            setActiveTabId(restored[restored.length - 1].id);
+          }
+        }
+      } catch (e) {
+        console.warn('Failed to parse saved session tabs:', e);
+      }
+    };
+
+    restoreSessionTabs();
+    return () => {
+      isCancelled = true;
+    };
+  }, []);
 
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [isConnectedToDrive, setIsConnectedToDrive] = useState<boolean>(false);
