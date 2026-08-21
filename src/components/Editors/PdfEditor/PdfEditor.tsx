@@ -1395,10 +1395,25 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
     setPageDimensions((prev) => (prev[pageNum] ? prev : { ...prev, [pageNum]: dim }));
   }, []);
 
-  // Annotation List & Undo/Redo Stacks
-  const [annotations, setAnnotations] = useState<AnnotationItem[]>([]);
+  // Annotation List & Undo/Redo Stacks (Auto-persisted to prevent data loss on sudden power/wifi cuts)
+  const [annotations, setAnnotations] = useState<AnnotationItem[]>(() => {
+    try {
+      const saved = localStorage.getItem(`pdf_annotations_${file.id || file.name}`);
+      return saved ? JSON.parse(saved) : [];
+    } catch (e) {
+      return [];
+    }
+  });
   const undoStackRef = useRef<AnnotationItem[][]>([]);
   const redoStackRef = useRef<AnnotationItem[][]>([]);
+
+  useEffect(() => {
+    if (annotations.length > 0) {
+      localStorage.setItem(`pdf_annotations_${file.id || file.name}`, JSON.stringify(annotations));
+    } else {
+      localStorage.removeItem(`pdf_annotations_${file.id || file.name}`);
+    }
+  }, [annotations, file.id, file.name]);
 
   const [pdfDocProxy, setPdfDocProxy] = useState<any>(null);
   const [isLoadingPdf, setIsLoadingPdf] = useState<boolean>(true);
