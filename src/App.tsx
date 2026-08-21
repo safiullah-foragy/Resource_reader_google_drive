@@ -49,6 +49,7 @@ export function App() {
   const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
 
   // Multi-Document Tabs State (Persisted across page refreshes)
+  const isSessionRestoredRef = React.useRef<boolean>(false);
   const [openDocuments, setOpenDocuments] = useState<OpenDocument[]>([]);
   const [activeTabId, setActiveTabId] = useState<string>(() => {
     return localStorage.getItem('studio_active_tab_id_v1') || 'explorer';
@@ -66,8 +67,10 @@ export function App() {
     return localStorage.getItem('studio_is_header_collapsed_v1') === 'true';
   });
 
-  // Persist open tabs and active document to localStorage
+  // Persist open tabs and active document to localStorage (Only after session is restored!)
   useEffect(() => {
+    if (!isSessionRestoredRef.current) return;
+
     if (openDocuments.length > 0) {
       const metaToSave = openDocuments.map((d) => ({
         id: d.id,
@@ -105,11 +108,17 @@ export function App() {
 
     const restoreSessionTabs = async () => {
       const savedMeta = localStorage.getItem('studio_open_docs_meta_v1');
-      if (!savedMeta) return;
+      if (!savedMeta) {
+        isSessionRestoredRef.current = true;
+        return;
+      }
 
       try {
         const metaList: Array<{ id: string; file: DriveFile; driveAccountId?: string }> = JSON.parse(savedMeta);
-        if (!Array.isArray(metaList) || metaList.length === 0) return;
+        if (!Array.isArray(metaList) || metaList.length === 0) {
+          isSessionRestoredRef.current = true;
+          return;
+        }
 
         const restored: OpenDocument[] = [];
 
@@ -156,6 +165,8 @@ export function App() {
         }
       } catch (e) {
         console.warn('Failed to parse saved session tabs:', e);
+      } finally {
+        isSessionRestoredRef.current = true;
       }
     };
 
@@ -257,6 +268,48 @@ export function App() {
     },
     [currentFolderId, searchQuery, showToast]
   );
+
+  // Offline Auto-Sync Worker (Triggers when internet connects or on app boot)
+  useEffect(() => {
+    const processOfflineQueue = async () => {
+      if (!navigator.onLine || !googleDriveService.isConnected()) return;
+
+      const pendingQueue = await fileBufferCache.getOfflineSyncQueue();
+      if (!pendingQueue || pendingQueue.length === 0) return;
+
+      showToast('info', 'Syncing Offline Changes', `Uploading ${pendingQueue.length} offline saved document(s) to Google Drive...`);
+
+      for (const item of pendingQueue) {
+        try {
+          const blob = new Blob([item.buffer], { type: item.mimeType });
+          await googleDriveService.uploadFileContent(
+            item.fileId,
+            item.fileName,
+            item.mimeType,
+            blob
+          );
+          await fileBufferCache.removeOfflineSync(item.fileId);
+          
+          setOpenDocuments((prev) =>
+            prev.map((d) => (d.id === item.fileId ? { ...d, saveStatus: 'saved', hasUnsavedChanges: false } : d))
+          );
+        } catch (err) {
+          console.warn(`Could not sync ${item.fileName} yet:`, err);
+        }
+      }
+
+      showToast('success', 'Offline Sync Complete', 'All offline updates were successfully uploaded to Google Drive.');
+      loadFolderFiles(currentFolderId, searchQuery);
+    };
+
+    window.addEventListener('online', processOfflineQueue);
+    // Initial check on load
+    processOfflineQueue();
+
+    return () => {
+      window.removeEventListener('online', processOfflineQueue);
+    };
+  }, [currentFolderId, searchQuery, loadFolderFiles, showToast]);
 
   // Switch Drive Account or Local
   const handleSelectAccount = async (accountId: string) => {
@@ -733,11 +786,51 @@ export function App() {
           )
         );
 
-        showToast('success', 'Changes Saved in Memory!', 'File updated. Click "Download" to save or Connect Google Drive to sync.');
+        showToast('success', 'Saved Directly in Local Cache!', 'File updated locally. Click "Download" to export or connect Google Drive to sync.');
         return;
       }
 
-      // 3. Connected to Google Drive: upload/patch file
+      // 3. Connected to Google Drive or Offline: Cache binary buffer locally first!
+      const newBuffer = await blobToArrayBuffer(modifiedBlob);
+      await fileBufferCache.set(activeDocument.id, newBuffer);
+
+      // If offline, queue for background sync when connection returns
+      if (!navigator.onLine) {
+        if (!file.id.startsWith('local_')) {
+          await fileBufferCache.queueOfflineSync({
+            fileId: activeDocument.file.id,
+            fileName: activeDocument.file.name,
+            mimeType: activeDocument.file.mimeType,
+            driveAccountId: activeDocument.driveAccountId,
+            modifiedTime: new Date().toISOString(),
+            buffer: newBuffer,
+          });
+        }
+
+        setOpenDocuments((prev) =>
+          prev.map((d) =>
+            d.id === activeDocument.id
+              ? {
+                  ...d,
+                  arrayBuffer: newBuffer,
+                  file: {
+                    ...d.file,
+                    rawBlob: modifiedBlob,
+                    size: modifiedBlob.size,
+                    modifiedTime: new Date().toISOString(),
+                  },
+                  hasUnsavedChanges: false,
+                  saveStatus: 'saved',
+                }
+              : d
+          )
+        );
+
+        showToast('info', 'Saved to Offline Cache', `"${file.name}" is stored safely in local memory and will automatically sync to Google Drive once reconnected.`);
+        return;
+      }
+
+      // Online Google Drive Upload
       let updated: DriveFile;
       if (file.id.startsWith('local_')) {
         // Upload local file to connected Google Drive
@@ -756,8 +849,6 @@ export function App() {
           modifiedBlob
         );
       }
-
-      const newBuffer = await blobToArrayBuffer(modifiedBlob);
 
       setOpenDocuments((prev) =>
         prev.map((d) =>
@@ -788,11 +879,39 @@ export function App() {
       loadFolderFiles(currentFolderId, searchQuery);
       showToast('success', 'Synced to Google Drive!', `Successfully saved "${updated.name}".`);
     } catch (err: any) {
-      console.error('Save to Drive error:', err);
-      setOpenDocuments((prev) =>
-        prev.map((d) => (d.id === activeDocument.id ? { ...d, saveStatus: 'error' } : d))
-      );
-      showToast('error', 'Save Failed', err.message || 'Failed to update file.');
+      console.warn('Save to Drive encountered an issue, storing in offline cache:', err);
+      try {
+        const fallbackBuffer = await blobToArrayBuffer(activeDocument.modifiedBlob);
+        await fileBufferCache.set(activeDocument.id, fallbackBuffer);
+        if (!activeDocument.file.id.startsWith('local_')) {
+          await fileBufferCache.queueOfflineSync({
+            fileId: activeDocument.file.id,
+            fileName: activeDocument.file.name,
+            mimeType: activeDocument.file.mimeType,
+            driveAccountId: activeDocument.driveAccountId,
+            modifiedTime: new Date().toISOString(),
+            buffer: fallbackBuffer,
+          });
+        }
+        setOpenDocuments((prev) =>
+          prev.map((d) =>
+            d.id === activeDocument.id
+              ? {
+                  ...d,
+                  arrayBuffer: fallbackBuffer,
+                  hasUnsavedChanges: false,
+                  saveStatus: 'saved',
+                }
+              : d
+          )
+        );
+        showToast('info', 'Saved in Offline Cache', `Network issue detected. "${activeDocument.file.name}" was saved locally and queued for automatic sync when online.`);
+      } catch (cacheErr) {
+        setOpenDocuments((prev) =>
+          prev.map((d) => (d.id === activeDocument.id ? { ...d, saveStatus: 'error' } : d))
+        );
+        showToast('error', 'Save Failed', err.message || 'Failed to update file.');
+      }
     }
   };
 
