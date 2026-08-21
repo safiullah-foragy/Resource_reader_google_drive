@@ -1290,7 +1290,7 @@ export function App() {
       }
     } catch (err: any) {
       console.error('Paste error:', err);
-      showToast('error', 'Paste Failed', err.message || 'Could not paste file.');
+      showToast('error', 'Paste Failed (File Safe)', (err.message ? `${err.message}. ` : '') + 'Original file is safe in its original location.');
     } finally {
       setIsLoading(false);
     }
