@@ -1,7 +1,7 @@
-import { DriveFile, GoogleCredentials } from '../types';
+import { ConnectedDriveAccount, DriveFile, GoogleCredentials } from '../types';
 import { getFileTypeFromMimeAndExt } from '../utils/fileTypeUtils';
 
-const SCOPES = 'https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/drive.file';
+const SCOPES = 'https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile';
 const DISCOVERY_DOC = 'https://www.googleapis.com/discovery/v1/apis/drive/v3/rest';
 
 declare global {
@@ -18,9 +18,81 @@ class GoogleDriveService {
   private gapiInited = false;
   private gisInited = false;
 
+  private accounts: ConnectedDriveAccount[] = [];
+  private activeAccountId: string | null = null;
+
   constructor() {
     this.loadSavedCredentials();
-    this.accessToken = localStorage.getItem('drive_studio_google_token') || null;
+    this.loadAccounts();
+  }
+
+  public loadAccounts(): ConnectedDriveAccount[] {
+    try {
+      const saved = localStorage.getItem('drive_studio_connected_accounts');
+      if (saved) {
+        this.accounts = JSON.parse(saved);
+      }
+      this.activeAccountId = localStorage.getItem('drive_studio_active_account_id') || null;
+
+      // Validate active account or fallback to first valid account
+      const active = this.accounts.find((a) => a.id === this.activeAccountId) || this.accounts[0] || null;
+      if (active) {
+        this.activeAccountId = active.id;
+        this.accessToken = active.token;
+      } else {
+        this.activeAccountId = null;
+        this.accessToken = null;
+      }
+    } catch (e) {
+      this.accounts = [];
+    }
+    return this.accounts;
+  }
+
+  private saveAccounts(): void {
+    localStorage.setItem('drive_studio_connected_accounts', JSON.stringify(this.accounts));
+    if (this.activeAccountId) {
+      localStorage.setItem('drive_studio_active_account_id', this.activeAccountId);
+    } else {
+      localStorage.removeItem('drive_studio_active_account_id');
+    }
+  }
+
+  public getAccounts(): ConnectedDriveAccount[] {
+    return this.accounts;
+  }
+
+  public getActiveAccount(): ConnectedDriveAccount | null {
+    if (!this.activeAccountId) return null;
+    return this.accounts.find((a) => a.id === this.activeAccountId) || null;
+  }
+
+  public switchAccount(accountId: string): ConnectedDriveAccount | null {
+    const target = this.accounts.find((a) => a.id === accountId);
+    if (!target) return null;
+
+    this.activeAccountId = target.id;
+    this.accessToken = target.token;
+    this.saveAccounts();
+    return target;
+  }
+
+  public removeAccount(accountId: string): void {
+    const target = this.accounts.find((a) => a.id === accountId);
+    if (target?.token && window.google?.accounts?.oauth2) {
+      try {
+        window.google.accounts.oauth2.revoke(target.token, () => {});
+      } catch (e) {
+        console.warn('Error revoking token:', e);
+      }
+    }
+    this.accounts = this.accounts.filter((a) => a.id !== accountId);
+    if (this.activeAccountId === accountId) {
+      const next = this.accounts[0] || null;
+      this.activeAccountId = next ? next.id : null;
+      this.accessToken = next ? next.token : null;
+    }
+    this.saveAccounts();
   }
 
   public loadSavedCredentials(): GoogleCredentials | null {
@@ -51,7 +123,11 @@ class GoogleDriveService {
   public clearCredentials(): void {
     this.credentials = null;
     this.accessToken = null;
+    this.accounts = [];
+    this.activeAccountId = null;
     localStorage.removeItem('drive_studio_google_creds');
+    localStorage.removeItem('drive_studio_connected_accounts');
+    localStorage.removeItem('drive_studio_active_account_id');
     localStorage.removeItem('drive_studio_google_token');
     localStorage.removeItem('drive_studio_token_expires');
   }
@@ -61,16 +137,20 @@ class GoogleDriveService {
   }
 
   public isConnected(): boolean {
-    if (!this.accessToken) return false;
-    const expiresAtStr = localStorage.getItem('drive_studio_token_expires');
-    if (expiresAtStr && parseInt(expiresAtStr, 10) < Date.now()) {
-      this.logout();
+    const active = this.getActiveAccount();
+    if (!active || !active.token) return false;
+    if (active.tokenExpires && active.tokenExpires < Date.now()) {
+      this.removeAccount(active.id);
       return false;
     }
     return true;
   }
 
-  public getAccessToken(): string | null {
+  public getAccessToken(accountId?: string): string | null {
+    if (accountId) {
+      const acc = this.accounts.find((a) => a.id === accountId);
+      if (acc) return acc.token;
+    }
     return this.accessToken;
   }
 
@@ -123,19 +203,7 @@ class GoogleDriveService {
       this.tokenClient = window.google.accounts.oauth2.initTokenClient({
         client_id: this.credentials.clientId,
         scope: SCOPES,
-        callback: (resp: any) => {
-          if (resp.error) {
-            console.error('Auth error:', resp);
-            return;
-          }
-          this.accessToken = resp.access_token;
-          if (this.accessToken) {
-            localStorage.setItem('drive_studio_google_token', this.accessToken);
-            // Tokens expire in ~3600 seconds
-            const expiresIn = resp.expires_in ? parseInt(resp.expires_in, 10) : 3500;
-            localStorage.setItem('drive_studio_token_expires', (Date.now() + expiresIn * 1000).toString());
-          }
-        },
+        callback: () => {},
       });
       this.gisInited = true;
       return true;
@@ -146,6 +214,14 @@ class GoogleDriveService {
   }
 
   public async login(): Promise<string> {
+    const account = await this.loginNewAccount();
+    return account.token;
+  }
+
+  /**
+   * Connect a new or additional Google Drive account
+   */
+  public async loginNewAccount(): Promise<ConnectedDriveAccount> {
     if (!this.credentials?.clientId) {
       throw new Error('Google Client ID is missing. Please configure credentials.');
     }
@@ -155,18 +231,60 @@ class GoogleDriveService {
 
     return new Promise((resolve, reject) => {
       try {
-        this.tokenClient.callback = (resp: any) => {
+        this.tokenClient.callback = async (resp: any) => {
           if (resp.error) {
             return reject(new Error(resp.error_description || resp.error));
           }
-          this.accessToken = resp.access_token;
-          localStorage.setItem('drive_studio_google_token', resp.access_token);
+          const token = resp.access_token;
           const expiresIn = resp.expires_in ? parseInt(resp.expires_in, 10) : 3500;
-          localStorage.setItem('drive_studio_token_expires', (Date.now() + expiresIn * 1000).toString());
-          resolve(resp.access_token);
+          const tokenExpires = Date.now() + expiresIn * 1000;
+
+          // Fetch user profile info
+          let email = `drive_account_${this.accounts.length + 1}@gmail.com`;
+          let name = `Drive ${this.accounts.length + 1}`;
+          let picture = '';
+
+          try {
+            const userResp = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+              headers: { Authorization: `Bearer ${token}` },
+            });
+            if (userResp.ok) {
+              const userInfo = await userResp.json();
+              if (userInfo.email) email = userInfo.email;
+              if (userInfo.name) name = userInfo.name;
+              if (userInfo.picture) picture = userInfo.picture;
+            }
+          } catch (e) {
+            console.warn('Could not fetch user profile info:', e);
+          }
+
+          const account: ConnectedDriveAccount = {
+            id: email,
+            email,
+            name,
+            picture,
+            token,
+            tokenExpires,
+            addedAt: new Date().toISOString(),
+          };
+
+          // Update existing or add new account
+          const existingIdx = this.accounts.findIndex((a) => a.id === account.id || a.email === account.email);
+          if (existingIdx >= 0) {
+            this.accounts[existingIdx] = account;
+          } else {
+            this.accounts.push(account);
+          }
+
+          this.activeAccountId = account.id;
+          this.accessToken = account.token;
+          this.saveAccounts();
+
+          resolve(account);
         };
 
-        this.tokenClient.requestAccessToken({ prompt: 'consent' });
+        // Always prompt account selection and consent so users must explicitly authenticate each time
+        this.tokenClient.requestAccessToken({ prompt: 'select_account consent' });
       } catch (err) {
         reject(err);
       }
@@ -174,14 +292,9 @@ class GoogleDriveService {
   }
 
   public logout(): void {
-    if (this.accessToken && window.google?.accounts?.oauth2) {
-      try {
-        window.google.accounts.oauth2.revoke(this.accessToken, () => {});
-      } catch (e) {}
+    if (this.activeAccountId) {
+      this.removeAccount(this.activeAccountId);
     }
-    this.accessToken = null;
-    localStorage.removeItem('drive_studio_google_token');
-    localStorage.removeItem('drive_studio_token_expires');
   }
 
   public async listFiles(folderId: string = 'root', searchQuery?: string): Promise<DriveFile[]> {
@@ -228,6 +341,7 @@ class GoogleDriveService {
       thumbnailLink: f.thumbnailLink,
       isFolder: f.mimeType === 'application/vnd.google-apps.folder',
       parentFolderId: f.parents?.[0],
+      driveAccountId: this.activeAccountId || undefined,
       isDemo: false,
     }));
   }

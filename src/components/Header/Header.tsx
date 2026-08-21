@@ -11,7 +11,8 @@ import {
   AlertCircle, 
   Layers,
   Cloud,
-  FileCheck
+  FileCheck,
+  Settings
 } from 'lucide-react';
 import { DriveFile, SaveStatus } from '../../types';
 
@@ -26,6 +27,7 @@ interface HeaderProps {
   onRenameFile: (newName: string) => void;
   isDarkMode: boolean;
   onToggleTheme: () => void;
+  onOpenSettings: () => void;
   isConnectedToDrive: boolean;
 }
 
@@ -40,6 +42,7 @@ export const Header: React.FC<HeaderProps> = ({
   onRenameFile,
   isDarkMode,
   onToggleTheme,
+  onOpenSettings,
   isConnectedToDrive,
 }) => {
   return (
@@ -157,6 +160,15 @@ export const Header: React.FC<HeaderProps> = ({
           title={isDarkMode ? 'Switch to Light Theme' : 'Switch to Dark Theme'}
         >
           {isDarkMode ? <Sun size={18} /> : <Moon size={18} />}
+        </button>
+
+        {/* Settings Button */}
+        <button
+          className="btn-ghost"
+          onClick={onOpenSettings}
+          title="Settings, Themes & UI Scale"
+        >
+          <Settings size={18} />
         </button>
       </div>
     </header>

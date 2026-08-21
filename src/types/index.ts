@@ -1,5 +1,15 @@
 export type SupportedFileType = 'pdf' | 'excel' | 'image' | 'doc' | 'unknown';
 
+export interface ConnectedDriveAccount {
+  id: string;
+  email: string;
+  name?: string;
+  picture?: string;
+  token: string;
+  tokenExpires: number;
+  addedAt: string;
+}
+
 export interface DriveFile {
   id: string;
   name: string;
@@ -12,6 +22,7 @@ export interface DriveFile {
   isFolder?: boolean;
   isDemo?: boolean;
   isLocal?: boolean;
+  driveAccountId?: string;
   fileHandle?: any;
   rawBlob?: Blob;
   rawArrayBuffer?: ArrayBuffer;
@@ -25,6 +36,7 @@ export interface OpenDocument {
   modifiedBlob: Blob;
   hasUnsavedChanges: boolean;
   saveStatus: SaveStatus;
+  driveAccountId?: string;
 }
 
 export interface BreadcrumbItem {

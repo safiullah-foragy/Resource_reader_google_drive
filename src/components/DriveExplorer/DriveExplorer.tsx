@@ -53,7 +53,7 @@ interface DriveExplorerProps {
   clipboard?: { file: DriveFile; operation: 'copy' | 'cut' } | null;
   onOpenLocalFilePicker: () => void;
   onOpenLocalFolder: () => void;
-  onOpenAuthModal: () => void;
+  onConnectDrive: () => void;
   isConnectedToDrive: boolean;
   onDisconnectDrive: () => void;
   onRefreshFiles: () => void;
@@ -84,7 +84,7 @@ export const DriveExplorer: React.FC<DriveExplorerProps> = ({
   clipboard,
   onOpenLocalFilePicker,
   onOpenLocalFolder,
-  onOpenAuthModal,
+  onConnectDrive,
   isConnectedToDrive,
   onDisconnectDrive,
   onRefreshFiles,
@@ -331,7 +331,7 @@ export const DriveExplorer: React.FC<DriveExplorerProps> = ({
                 </button>
               </div>
             ) : (
-              <button className="btn-secondary" onClick={onOpenAuthModal} style={{ borderColor: 'rgba(59, 130, 246, 0.4)' }}>
+              <button className="btn-secondary" onClick={onConnectDrive} style={{ borderColor: 'rgba(59, 130, 246, 0.4)' }}>
                 <ShieldAlert size={16} style={{ color: '#3b82f6' }} />
                 <span>Connect Google Drive</span>
               </button>
@@ -549,7 +549,7 @@ export const DriveExplorer: React.FC<DriveExplorerProps> = ({
               <UploadCloud size={18} />
               <span>Open Local File</span>
             </button>
-            <button className="btn-secondary" onClick={onOpenAuthModal} style={{ padding: '0.7rem 1.35rem', fontSize: '0.95rem' }}>
+            <button className="btn-secondary" onClick={onConnectDrive} style={{ padding: '0.7rem 1.35rem', fontSize: '0.95rem' }}>
               <HardDrive size={18} style={{ color: '#3b82f6' }} />
               <span>Connect Google Drive</span>
             </button>

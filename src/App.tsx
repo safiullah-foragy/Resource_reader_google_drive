@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import './App.css';
-import { BreadcrumbItem, DriveFile, OpenDocument, SaveStatus, ToastNotification } from './types';
+import { BreadcrumbItem, ConnectedDriveAccount, DriveFile, OpenDocument, SaveStatus, ToastNotification } from './types';
 import { googleDriveService } from './services/googleDriveService';
 import { getFileTypeFromMimeAndExt, downloadBlob, blobToArrayBuffer } from './utils/fileTypeUtils';
 import {
@@ -12,8 +12,8 @@ import {
 import { TabBar } from './components/Header/TabBar';
 import { Header } from './components/Header/Header';
 import { DriveExplorer } from './components/DriveExplorer/DriveExplorer';
-import { GoogleAuthModal } from './components/DriveExplorer/GoogleAuthModal';
 import { ToastContainer } from './components/Common/ToastContainer';
+import { SettingsModal, AppTheme } from './components/Settings/SettingsModal';
 
 import { PdfEditor } from './components/Editors/PdfEditor/PdfEditor';
 import { ExcelEditor } from './components/Editors/ExcelEditor/ExcelEditor';
@@ -24,24 +24,40 @@ export function App() {
   const [files, setFiles] = useState<DriveFile[]>([]);
   const [currentFolderId, setCurrentFolderId] = useState<string>('root');
   const [breadcrumbs, setBreadcrumbs] = useState<BreadcrumbItem[]>([
-    { id: 'local-workspace', name: 'Local & Cloud Workspace' },
+    { id: 'local-workspace', name: 'Local Drive' },
   ]);
   const [searchQuery, setSearchQuery] = useState<string>('');
+
+  // Multi-Account Google Drive State
+  const [connectedAccounts, setConnectedAccounts] = useState<ConnectedDriveAccount[]>(
+    googleDriveService.getAccounts()
+  );
+  const [activeAccountId, setActiveAccountId] = useState<string | null>(
+    googleDriveService.getActiveAccount()?.id || (googleDriveService.isConnected() ? googleDriveService.getAccounts()[0]?.id : null) || 'local'
+  );
+
+  // Settings: 5 Themes & UI Scaling
+  const [currentTheme, setCurrentTheme] = useState<AppTheme>(() => {
+    return (localStorage.getItem('drive_studio_theme') as AppTheme) || 'dark';
+  });
+  const [uiScale, setUiScale] = useState<number>(() => {
+    const saved = localStorage.getItem('drive_studio_ui_scale');
+    return saved ? parseFloat(saved) : 1.0;
+  });
+  const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
 
   // Multi-Document Tabs State
   const [openDocuments, setOpenDocuments] = useState<OpenDocument[]>([]);
   const [activeTabId, setActiveTabId] = useState<string>('explorer'); // 'explorer' or document id
 
   const [isLoading, setIsLoading] = useState<boolean>(false);
-  const [isAuthModalOpen, setIsAuthModalOpen] = useState<boolean>(false);
   const [isConnectedToDrive, setIsConnectedToDrive] = useState<boolean>(false);
-  const [isDarkMode, setIsDarkMode] = useState<boolean>(true);
   const [toasts, setToasts] = useState<ToastNotification[]>([]);
   const [clipboard, setClipboard] = useState<{ file: DriveFile; operation: 'copy' | 'cut' } | null>(null);
 
   // Folder Navigation History (Back / Forward)
   const [navHistory, setNavHistory] = useState<Array<{ folderId: string; breadcrumbs: BreadcrumbItem[] }>>([
-    { folderId: 'root', breadcrumbs: [{ id: 'local-workspace', name: 'Local & Cloud Workspace' }] },
+    { folderId: 'root', breadcrumbs: [{ id: 'local-workspace', name: 'Local Drive' }] },
   ]);
   const [navHistoryIndex, setNavHistoryIndex] = useState<number>(0);
 
@@ -127,6 +143,93 @@ export function App() {
     [currentFolderId, searchQuery, showToast]
   );
 
+  // Switch Drive Account or Local
+  const handleSelectAccount = async (accountId: string) => {
+    if (accountId === 'local') {
+      setActiveAccountId('local');
+      setIsConnectedToDrive(false);
+      try {
+        const savedDirHandle = await getPersistedDirectoryHandle();
+        if (savedDirHandle) {
+          setIsLoading(true);
+          const localFiles = await readFilesFromDirectoryHandle(savedDirHandle);
+          setFiles(localFiles);
+          setBreadcrumbs([{ id: 'local-dir', name: savedDirHandle.name || 'Local Drive' }]);
+        } else {
+          setFiles([]);
+          setBreadcrumbs([{ id: 'local-workspace', name: 'Local Drive' }]);
+        }
+      } catch (e) {
+        setFiles([]);
+        setBreadcrumbs([{ id: 'local-workspace', name: 'Local Drive' }]);
+      } finally {
+        setIsLoading(false);
+      }
+      return;
+    }
+
+    const switched = googleDriveService.switchAccount(accountId);
+    if (switched) {
+      setActiveAccountId(switched.id);
+      setIsConnectedToDrive(true);
+      setCurrentFolderId('root');
+      const accountName = switched.name || switched.email.split('@')[0];
+      setBreadcrumbs([{ id: 'root', name: `${accountName}'s Drive` }]);
+      loadFolderFiles('root', '');
+      showToast('info', `Switched to ${switched.email}`, 'Now viewing files for this Google Drive.');
+    }
+  };
+
+  // Add / Connect Additional Google Drive Account
+  const handleAddAccount = async () => {
+    try {
+      setIsLoading(true);
+      const newAcc = await googleDriveService.loginNewAccount();
+      const accountsList = googleDriveService.getAccounts();
+      setConnectedAccounts([...accountsList]);
+      setActiveAccountId(newAcc.id);
+      setIsConnectedToDrive(true);
+      setCurrentFolderId('root');
+      const accountName = newAcc.name || newAcc.email.split('@')[0];
+      setBreadcrumbs([{ id: 'root', name: `${accountName}'s Drive` }]);
+      loadFolderFiles('root', '');
+      showToast('success', 'Connected Google Drive!', `Added ${newAcc.email} to your workspaces.`);
+    } catch (err: any) {
+      if (err.name !== 'AbortError' && !err.message?.includes('cancelled')) {
+        console.error('Error adding drive account:', err);
+        showToast('error', 'Connection Failed', err.message || 'Could not connect Google Drive account.');
+      }
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Remove / Disconnect Specific Drive Account
+  const handleRemoveAccount = (e: React.MouseEvent, accountId: string) => {
+    e.stopPropagation();
+    googleDriveService.removeAccount(accountId);
+    const updated = [...googleDriveService.getAccounts()];
+    setConnectedAccounts(updated);
+
+    // Close open document tabs that belong to this disconnected account
+    setOpenDocuments((prev) => {
+      const remaining = prev.filter((d) => d.driveAccountId !== accountId);
+      if (activeDocument && activeDocument.driveAccountId === accountId) {
+        setActiveTabId('explorer');
+      }
+      return remaining;
+    });
+
+    if (activeAccountId === accountId) {
+      if (updated.length > 0) {
+        handleSelectAccount(updated[0].id);
+      } else {
+        handleSelectAccount('local');
+      }
+    }
+    showToast('info', 'Disconnected Account', 'Removed Google Drive connection.');
+  };
+
   // Restore active login session or persisted Local Drive on startup
   useEffect(() => {
     let isCancelled = false;
@@ -134,6 +237,12 @@ export function App() {
     async function initWorkspace() {
       if (googleDriveService.isConnected()) {
         setIsConnectedToDrive(true);
+        const active = googleDriveService.getActiveAccount();
+        if (active) {
+          setActiveAccountId(active.id);
+          const accountName = active.name || active.email.split('@')[0];
+          setBreadcrumbs([{ id: 'root', name: `${accountName}'s Drive` }]);
+        }
         loadFolderFiles(currentFolderId, searchQuery);
         return;
       }
@@ -152,13 +261,13 @@ export function App() {
           }
         } else if (!isCancelled) {
           setFiles([]);
-          setBreadcrumbs([{ id: 'local-workspace', name: 'Local & Cloud Workspace' }]);
+          setBreadcrumbs([{ id: 'local-workspace', name: 'Local Drive' }]);
         }
       } catch (err) {
         console.warn('Could not auto-restore persisted directory:', err);
         if (!isCancelled) {
           setFiles([]);
-          setBreadcrumbs([{ id: 'local-workspace', name: 'Local & Cloud Workspace' }]);
+          setBreadcrumbs([{ id: 'local-workspace', name: 'Local Drive' }]);
         }
       } finally {
         if (!isCancelled) setIsLoading(false);
@@ -245,6 +354,7 @@ export function App() {
         modifiedBlob: initialBlob,
         hasUnsavedChanges: false,
         saveStatus: 'idle',
+        driveAccountId: file.driveAccountId || (activeAccountId !== 'local' ? activeAccountId || undefined : undefined),
       };
 
       setOpenDocuments((prev) => {
@@ -705,53 +815,130 @@ export function App() {
     setClipboard(null);
   };
 
-  // Paste File into Current Folder
+  // Helper to extract binary data for universal cross-drive pasting
+  const getFileBinary = async (file: DriveFile): Promise<{ blob: Blob; buffer: ArrayBuffer }> => {
+    if (file.rawBlob) {
+      const buffer = file.rawArrayBuffer || (await blobToArrayBuffer(file.rawBlob));
+      return { blob: file.rawBlob, buffer };
+    }
+    if (file.fileHandle && typeof file.fileHandle.getFile === 'function') {
+      const localFile = await file.fileHandle.getFile();
+      const buffer = await localFile.arrayBuffer();
+      const blob = new Blob([buffer], { type: localFile.type || file.mimeType || 'application/octet-stream' });
+      return { blob, buffer };
+    }
+    if (file.isLocal || file.id.startsWith('local_')) {
+      throw new Error('Local file binary data is not available.');
+    }
+    // Download binary from Google Drive
+    const { data } = await googleDriveService.downloadFile(file.id, file.mimeType);
+    const blob = new Blob([data], { type: file.mimeType || 'application/octet-stream' });
+    return { blob, buffer: data };
+  };
+
+  // Universal Paste File into Current Folder (Local, Drive 1, Drive 2, Cross-Drive)
   const handlePasteFile = async () => {
     if (!clipboard) return;
 
     setIsLoading(true);
     try {
+      const srcFile = clipboard.file;
+      const isSrcLocal = srcFile.isLocal || srcFile.id.startsWith('local_');
+      const isDestLocal = !isConnectedToDrive || activeAccountId === 'local';
+      const isSameDriveAccount =
+        !isSrcLocal &&
+        !isDestLocal &&
+        (srcFile.driveAccountId === activeAccountId || (!srcFile.driveAccountId && !activeAccountId));
+
       if (clipboard.operation === 'copy') {
-        if (googleDriveService.isConnected()) {
+        if (isSameDriveAccount) {
+          // Native same-drive copy
           const copied = await googleDriveService.copyFile(
-            clipboard.file.id,
+            srcFile.id,
             currentFolderId !== 'root' ? currentFolderId : undefined
           );
           setFiles((prev) => [copied, ...prev]);
           showToast('success', 'File Copied in Drive!', `Pasted "${copied.name}" into this folder.`);
-        } else {
-          const copyName = 'Copy_' + clipboard.file.name;
-          const localCopy: DriveFile = {
-            ...clipboard.file,
-            id: 'local_copy_' + Date.now(),
-            name: copyName,
-            parentFolderId: currentFolderId,
-          };
-          setFiles((prev) => [localCopy, ...prev]);
-          showToast('success', 'File Copied!', `Pasted "${copyName}" into this folder.`);
-        }
-      } else if (clipboard.operation === 'cut') {
-        if (googleDriveService.isConnected()) {
-          const moved = await googleDriveService.moveFile(
-            clipboard.file.id,
-            clipboard.file.parentFolderId,
+        } else if (!isDestLocal) {
+          // Cross-Drive or Local-to-Drive: upload binary directly to current Google Drive
+          const { blob } = await getFileBinary(srcFile);
+          const uploaded = await googleDriveService.createNewFile(
+            srcFile.name,
+            srcFile.mimeType,
+            blob,
             currentFolderId !== 'root' ? currentFolderId : undefined
           );
-          setFiles((prev) => [moved, ...prev.filter((f) => f.id !== clipboard.file.id)]);
-          showToast('success', 'File Moved in Drive!', `Moved "${moved.name}" into this folder.`);
+          setFiles((prev) => [uploaded, ...prev]);
+          showToast('success', 'Pasted into Google Drive!', `Uploaded "${uploaded.name}" into this Drive folder.`);
         } else {
-          const movedLocal: DriveFile = {
-            ...clipboard.file,
+          // Paste into Local Drive (from Local or from Google Drive)
+          const { blob, buffer } = await getFileBinary(srcFile);
+          const copyName = isSrcLocal ? 'Copy_' + srcFile.name : srcFile.name;
+          const localCopy: DriveFile = {
+            ...srcFile,
+            id: 'local_copy_' + Date.now(),
+            name: copyName,
+            isLocal: true,
             parentFolderId: currentFolderId,
+            rawBlob: blob,
+            rawArrayBuffer: buffer,
           };
-          setFiles((prev) => [movedLocal, ...prev.filter((f) => f.id !== clipboard.file.id)]);
-          showToast('success', 'File Moved!', `Moved "${movedLocal.name}" into this folder.`);
+          setFiles((prev) => [localCopy, ...prev]);
+          showToast('success', 'File Pasted Locally!', `Added "${copyName}" to local folder.`);
+        }
+      } else if (clipboard.operation === 'cut') {
+        if (isSameDriveAccount) {
+          // Native same-drive move
+          const moved = await googleDriveService.moveFile(
+            srcFile.id,
+            srcFile.parentFolderId,
+            currentFolderId !== 'root' ? currentFolderId : undefined
+          );
+          setFiles((prev) => [moved, ...prev.filter((f) => f.id !== srcFile.id)]);
+          showToast('success', 'File Moved in Drive!', `Moved "${moved.name}" into this folder.`);
+        } else if (!isDestLocal) {
+          // Move from Local / Drive 1 into Drive 2
+          const { blob } = await getFileBinary(srcFile);
+          const uploaded = await googleDriveService.createNewFile(
+            srcFile.name,
+            srcFile.mimeType,
+            blob,
+            currentFolderId !== 'root' ? currentFolderId : undefined
+          );
+          // Delete original from source
+          if (isSrcLocal) {
+            setFiles((prev) => prev.filter((f) => f.id !== srcFile.id));
+          } else {
+            try {
+              await googleDriveService.deleteFile(srcFile.id);
+            } catch (e) {}
+          }
+          setFiles((prev) => [uploaded, ...prev.filter((f) => f.id !== srcFile.id)]);
+          showToast('success', 'File Moved to Google Drive!', `Moved "${uploaded.name}" into this Drive.`);
+        } else {
+          // Move from Google Drive into Local Drive
+          const { blob, buffer } = await getFileBinary(srcFile);
+          const movedLocal: DriveFile = {
+            ...srcFile,
+            id: isSrcLocal ? srcFile.id : 'local_' + Date.now(),
+            isLocal: true,
+            parentFolderId: currentFolderId,
+            rawBlob: blob,
+            rawArrayBuffer: buffer,
+          };
+          if (!isSrcLocal) {
+            try {
+              await googleDriveService.deleteFile(srcFile.id);
+            } catch (e) {}
+          }
+          setFiles((prev) => [movedLocal, ...prev.filter((f) => f.id !== srcFile.id)]);
+          showToast('success', 'File Moved Locally!', `Moved "${movedLocal.name}" into this folder.`);
         }
         setClipboard(null);
       }
     } catch (err: any) {
       console.error('Paste error:', err);
-      showToast('error', 'Paste Failed', err.message || 'Could not paste file into folder.');
+      showToast('error', 'Paste Failed', err.message || 'Could not paste file.');
     } finally {
       setIsLoading(false);
     }
@@ -827,13 +1014,42 @@ export function App() {
     );
   };
 
-  // Theme Toggle
+  // Apply Theme
+  const applyTheme = (theme: AppTheme) => {
+    setCurrentTheme(theme);
+    localStorage.setItem('drive_studio_theme', theme);
+    document.body.className = `theme-${theme} ${theme === 'light' ? 'light-theme' : 'dark-theme'}`;
+  };
+
+  // Apply UI Scaling
+  const applyUiScale = (scale: number) => {
+    setUiScale(scale);
+    localStorage.setItem('drive_studio_ui_scale', scale.toString());
+    document.documentElement.style.fontSize = `${scale * 100}%`;
+    document.documentElement.style.setProperty('--ui-scale', scale.toString());
+  };
+
+  // Initialize theme & zoom on mount
+  useEffect(() => {
+    applyTheme(currentTheme);
+    applyUiScale(uiScale);
+  }, []);
+
+  // Theme Toggle (Quick switch between dark and light)
   const handleToggleTheme = () => {
-    setIsDarkMode((prev) => {
-      const next = !prev;
-      document.body.className = next ? 'dark-theme' : 'light-theme';
-      return next;
+    const nextTheme: AppTheme = currentTheme === 'dark' ? 'light' : 'dark';
+    applyTheme(nextTheme);
+  };
+
+  // Disconnect All Google Drives
+  const handleDisconnectAll = () => {
+    connectedAccounts.forEach((acc) => {
+      googleDriveService.removeAccount(acc.id);
     });
+    setConnectedAccounts([]);
+    setOpenDocuments((prev) => prev.filter((d) => d.file.isLocal));
+    handleSelectAccount('local');
+    showToast('info', 'Disconnected All', 'All Google Drive accounts have been logged out.');
   };
 
   // Disconnect Drive
@@ -841,7 +1057,7 @@ export function App() {
     googleDriveService.logout();
     setIsConnectedToDrive(false);
     setFiles([]);
-    setBreadcrumbs([{ id: 'root', name: 'My Drive' }]);
+    setBreadcrumbs([{ id: 'root', name: 'Local Drive' }]);
     showToast('info', 'Disconnected', 'Google Drive session closed.');
   };
 
@@ -851,7 +1067,12 @@ export function App() {
       <TabBar
         openDocuments={openDocuments}
         activeTabId={activeTabId}
+        connectedAccounts={connectedAccounts}
+        activeAccountId={activeAccountId}
         onSelectTab={(tabId) => setActiveTabId(tabId)}
+        onSelectAccount={handleSelectAccount}
+        onAddAccount={handleAddAccount}
+        onRemoveAccount={handleRemoveAccount}
         onCloseTab={handleCloseTab}
         onOpenExplorer={() => setActiveTabId('explorer')}
       />
@@ -866,8 +1087,9 @@ export function App() {
         onSaveAsCopy={handleSaveAsCopy}
         onDownloadLocal={handleDownloadLocal}
         onRenameFile={handleRenameFile}
-        isDarkMode={isDarkMode}
+        isDarkMode={currentTheme !== 'light'}
         onToggleTheme={handleToggleTheme}
+        onOpenSettings={() => setIsSettingsOpen(true)}
         isConnectedToDrive={isConnectedToDrive}
       />
 
@@ -896,7 +1118,7 @@ export function App() {
             clipboard={clipboard}
             onOpenLocalFilePicker={handleOpenLocalFilePicker}
             onOpenLocalFolder={handleOpenLocalFolder}
-            onOpenAuthModal={() => setIsAuthModalOpen(true)}
+            onConnectDrive={handleAddAccount}
             isConnectedToDrive={isConnectedToDrive}
             onDisconnectDrive={handleDisconnectDrive}
             onRefreshFiles={() => loadFolderFiles(currentFolderId, searchQuery)}
@@ -961,15 +1183,17 @@ export function App() {
         )}
       </main>
 
-      {/* Google Auth Modal */}
-      <GoogleAuthModal
-        isOpen={isAuthModalOpen}
-        onClose={() => setIsAuthModalOpen(false)}
-        onConnected={() => {
-          setIsConnectedToDrive(true);
-          loadFolderFiles('root');
-          showToast('success', 'Connected to Google Drive!', 'Your Drive folders and files are now accessible.');
-        }}
+      {/* Settings Modal (5 Themes, UI Scaling, Account Management & Logout) */}
+      <SettingsModal
+        isOpen={isSettingsOpen}
+        onClose={() => setIsSettingsOpen(false)}
+        currentTheme={currentTheme}
+        onSelectTheme={applyTheme}
+        uiScale={uiScale}
+        onSetUiScale={applyUiScale}
+        connectedAccounts={connectedAccounts}
+        onDisconnectAccount={(accId) => handleRemoveAccount({ stopPropagation: () => {} } as any, accId)}
+        onDisconnectAll={handleDisconnectAll}
       />
 
       {/* Toast Notifications */}

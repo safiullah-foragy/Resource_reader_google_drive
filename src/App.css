@@ -4,6 +4,7 @@
   flex-direction: column;
   height: 100vh;
   width: 100vw;
+  max-width: 100%;
   background-color: var(--bg-primary);
   color: var(--text-primary);
   overflow: hidden;
@@ -11,8 +12,8 @@
 
 /* App Header */
 .app-header {
-  height: 56px;
-  min-height: 56px;
+  height: 3.5rem;
+  min-height: 3.5rem;
   background: var(--bg-secondary);
   border-bottom: 1px solid var(--border-subtle);
   display: flex;
@@ -213,8 +214,10 @@
 /* File Cards Grid */
 .files-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(max(220px, 15rem), 1fr));
   gap: 1.25rem;
+  width: 100%;
+  box-sizing: border-box;
 }
 
 .file-card {
