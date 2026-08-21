@@ -1635,6 +1635,13 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
   });
 
   const handleStartDragScroll = useCallback((e: React.MouseEvent) => {
+    // If double click or multi click (e.detail >= 2), cancel drag and prevent native browser word selection / scroll
+    if (e.detail > 1) {
+      e.preventDefault();
+      e.stopPropagation();
+      panDragRef.current.isDragging = false;
+      return;
+    }
     if (!scrollContainerRef.current) return;
     panDragRef.current = {
       clientY: e.clientY,
@@ -2778,7 +2785,7 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
         </div>
       </div>
 
-      {/* Continuous Multi-Page Scroll Viewport (with Press & Hold Momentum Drag-Scroll) */}
+      {/* Continuous Multi-Page Scroll Viewport (with Press & Hold Drag-Scroll) */}
       <div
         ref={scrollContainerRef}
         className="editor-viewport"
@@ -2787,6 +2794,12 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
         onMouseMove={handleMoveDragScroll}
         onMouseUp={handleEndDragScroll}
         onMouseLeave={handleEndDragScroll}
+        onMouseDownCapture={(e) => {
+          if (e.detail > 1) {
+            e.preventDefault();
+            e.stopPropagation();
+          }
+        }}
         onDoubleClick={(e) => {
           e.preventDefault();
           e.stopPropagation();
