@@ -11,9 +11,20 @@ export interface DriveFile {
   thumbnailLink?: string;
   isFolder?: boolean;
   isDemo?: boolean;
+  isLocal?: boolean;
+  fileHandle?: any;
   rawBlob?: Blob;
   rawArrayBuffer?: ArrayBuffer;
   parentFolderId?: string;
+}
+
+export interface OpenDocument {
+  id: string;
+  file: DriveFile;
+  arrayBuffer: ArrayBuffer;
+  modifiedBlob: Blob;
+  hasUnsavedChanges: boolean;
+  saveStatus: SaveStatus;
 }
 
 export interface BreadcrumbItem {
@@ -60,6 +71,8 @@ export interface AnnotationItem {
   fontFamily?: string;
   backgroundColor?: string;
   fill?: boolean;
+  width?: number;
+  height?: number;
 }
 
 export interface ToastNotification {

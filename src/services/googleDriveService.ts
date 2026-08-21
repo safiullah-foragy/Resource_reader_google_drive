@@ -33,10 +33,12 @@ class GoogleDriveService {
     } catch (e) {
       console.error('Failed to load saved credentials', e);
     }
-    // Preload default client ID
+    // Preload default client ID (or from env variable)
     this.credentials = {
-      clientId: '60848340645-t0am6ngk8f7u8dc7lgs03k4bt57rmkf8.apps.googleusercontent.com',
-      apiKey: '',
+      clientId:
+        (import.meta as any).env?.VITE_GOOGLE_CLIENT_ID ||
+        '60848340645-t0am6ngk8f7u8dc7lgs03k4bt57rmkf8.apps.googleusercontent.com',
+      apiKey: (import.meta as any).env?.VITE_GOOGLE_API_KEY || '',
     };
     return this.credentials;
   }
@@ -51,6 +53,7 @@ class GoogleDriveService {
     this.accessToken = null;
     localStorage.removeItem('drive_studio_google_creds');
     localStorage.removeItem('drive_studio_google_token');
+    localStorage.removeItem('drive_studio_token_expires');
   }
 
   public getCredentials(): GoogleCredentials | null {
@@ -58,7 +61,13 @@ class GoogleDriveService {
   }
 
   public isConnected(): boolean {
-    return !!this.accessToken;
+    if (!this.accessToken) return false;
+    const expiresAtStr = localStorage.getItem('drive_studio_token_expires');
+    if (expiresAtStr && parseInt(expiresAtStr, 10) < Date.now()) {
+      this.logout();
+      return false;
+    }
+    return true;
   }
 
   public getAccessToken(): string | null {
@@ -122,6 +131,9 @@ class GoogleDriveService {
           this.accessToken = resp.access_token;
           if (this.accessToken) {
             localStorage.setItem('drive_studio_google_token', this.accessToken);
+            // Tokens expire in ~3600 seconds
+            const expiresIn = resp.expires_in ? parseInt(resp.expires_in, 10) : 3500;
+            localStorage.setItem('drive_studio_token_expires', (Date.now() + expiresIn * 1000).toString());
           }
         },
       });
@@ -149,6 +161,8 @@ class GoogleDriveService {
           }
           this.accessToken = resp.access_token;
           localStorage.setItem('drive_studio_google_token', resp.access_token);
+          const expiresIn = resp.expires_in ? parseInt(resp.expires_in, 10) : 3500;
+          localStorage.setItem('drive_studio_token_expires', (Date.now() + expiresIn * 1000).toString());
           resolve(resp.access_token);
         };
 
@@ -161,19 +175,18 @@ class GoogleDriveService {
 
   public logout(): void {
     if (this.accessToken && window.google?.accounts?.oauth2) {
-      window.google.accounts.oauth2.revoke(this.accessToken, () => {
-        this.accessToken = null;
-        localStorage.removeItem('drive_studio_google_token');
-      });
-    } else {
-      this.accessToken = null;
-      localStorage.removeItem('drive_studio_google_token');
+      try {
+        window.google.accounts.oauth2.revoke(this.accessToken, () => {});
+      } catch (e) {}
     }
+    this.accessToken = null;
+    localStorage.removeItem('drive_studio_google_token');
+    localStorage.removeItem('drive_studio_token_expires');
   }
 
   public async listFiles(folderId: string = 'root', searchQuery?: string): Promise<DriveFile[]> {
-    if (!this.accessToken) {
-      throw new Error('Not authenticated. Please connect to Google Drive first.');
+    if (!this.isConnected()) {
+      throw new Error('Authentication expired. Please connect to Google Drive.');
     }
 
     let q = "trashed = false";
@@ -193,6 +206,10 @@ class GoogleDriveService {
     });
 
     if (!response.ok) {
+      if (response.status === 401) {
+        this.logout();
+        throw new Error('Authentication expired. Please connect to Google Drive.');
+      }
       const errJson = await response.json().catch(() => ({}));
       throw new Error(errJson.error?.message || `Failed to fetch files: ${response.statusText}`);
     }
@@ -247,7 +264,7 @@ class GoogleDriveService {
   }
 
   /**
-   * Lossless Multipart Upload to Google Drive
+   * Lossless Direct Media Upload to Google Drive
    * Preserves exact binary stream without corrupting PDF / XLSX / Image bytes.
    */
   public async uploadFileContent(
@@ -256,58 +273,64 @@ class GoogleDriveService {
     mimeType: string,
     content: Blob | ArrayBuffer
   ): Promise<DriveFile> {
-    if (!this.accessToken) {
-      throw new Error('Not authenticated with Google Drive.');
+    if (!this.isConnected()) {
+      throw new Error('Authentication expired. Please connect to Google Drive.');
     }
-
-    const boundary = '-------314159265358979323846';
-    const delimiter = `\r\n--${boundary}\r\n`;
-    const closeDelimiter = `\r\n--${boundary}--`;
-
-    const metadata = {
-      name: fileName,
-      mimeType: mimeType,
-    };
 
     const blobContent = content instanceof Blob ? content : new Blob([content], { type: mimeType });
 
-    const metadataPart = new Blob(
-      [`${delimiter}Content-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(metadata)}\r\n`],
-      { type: 'text/plain' }
-    );
-
-    const mediaHeaderPart = new Blob(
-      [`${delimiter}Content-Type: ${mimeType}\r\n\r\n`],
-      { type: 'text/plain' }
-    );
-
-    const closePart = new Blob([closeDelimiter], { type: 'text/plain' });
-
-    // Combine all chunks into a unified multipart body Blob to preserve binary integrity
-    const multipartRequestBody = new Blob([metadataPart, mediaHeaderPart, blobContent, closePart]);
-
-    const uploadUrl = `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=multipart`;
+    // Step 1: Upload the binary content directly to Google Drive via uploadType=media
+    const uploadUrl = `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`;
 
     const response = await fetch(uploadUrl, {
       method: 'PATCH',
       headers: {
         Authorization: `Bearer ${this.accessToken}`,
-        'Content-Type': `multipart/related; boundary=${boundary}`,
+        'Content-Type': mimeType || 'application/octet-stream',
       },
-      body: multipartRequestBody,
+      body: blobContent,
     });
 
     if (!response.ok) {
+      if (response.status === 401) {
+        this.logout();
+        throw new Error('Authentication expired. Please reconnect to Google Drive.');
+      }
       const errJson = await response.json().catch(() => ({}));
       throw new Error(errJson.error?.message || `Failed to update file in Google Drive: ${response.statusText}`);
     }
 
-    const updated = await response.json();
+    // Step 2: If fileName was provided, update metadata name
+    try {
+      const metaUrl = `https://www.googleapis.com/drive/v3/files/${fileId}`;
+      const metaResp = await fetch(metaUrl, {
+        method: 'PATCH',
+        headers: {
+          Authorization: `Bearer ${this.accessToken}`,
+          'Content-Type': 'application/json; charset=UTF-8',
+        },
+        body: JSON.stringify({ name: fileName }),
+      });
+      if (metaResp.ok) {
+        const metaJson = await metaResp.json();
+        return {
+          id: metaJson.id,
+          name: metaJson.name,
+          mimeType: metaJson.mimeType,
+          fileType: getFileTypeFromMimeAndExt(metaJson.mimeType, metaJson.name),
+          isDemo: false,
+        };
+      }
+    } catch (e) {
+      console.warn('Metadata name update note:', e);
+    }
+
+    const updated = await response.json().catch(() => ({ id: fileId, name: fileName, mimeType }));
     return {
-      id: updated.id,
-      name: updated.name,
-      mimeType: updated.mimeType,
-      fileType: getFileTypeFromMimeAndExt(updated.mimeType, updated.name),
+      id: updated.id || fileId,
+      name: updated.name || fileName,
+      mimeType: updated.mimeType || mimeType,
+      fileType: getFileTypeFromMimeAndExt(updated.mimeType || mimeType, updated.name || fileName),
       isDemo: false,
     };
   }
@@ -321,52 +344,145 @@ class GoogleDriveService {
     content: Blob | ArrayBuffer,
     parentFolderId?: string
   ): Promise<DriveFile> {
-    if (!this.accessToken) {
-      throw new Error('Not authenticated with Google Drive.');
+    if (!this.isConnected()) {
+      throw new Error('Authentication expired. Please connect to Google Drive.');
     }
 
-    const boundary = '-------314159265358979323846';
-    const delimiter = `\r\n--${boundary}\r\n`;
-    const closeDelimiter = `\r\n--${boundary}--`;
-
-    const metadata: any = {
+    // Step 1: Create file metadata
+    const createMetaUrl = 'https://www.googleapis.com/drive/v3/files';
+    const metaBody: any = {
       name: fileName,
       mimeType: mimeType,
     };
-
-    if (parentFolderId) {
-      metadata.parents = [parentFolderId];
+    if (parentFolderId && parentFolderId !== 'root') {
+      metaBody.parents = [parentFolderId];
     }
 
-    const blobContent = content instanceof Blob ? content : new Blob([content], { type: mimeType });
-
-    const metadataPart = new Blob(
-      [`${delimiter}Content-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(metadata)}\r\n`],
-      { type: 'text/plain' }
-    );
-
-    const mediaHeaderPart = new Blob(
-      [`${delimiter}Content-Type: ${mimeType}\r\n\r\n`],
-      { type: 'text/plain' }
-    );
-
-    const closePart = new Blob([closeDelimiter], { type: 'text/plain' });
-    const multipartRequestBody = new Blob([metadataPart, mediaHeaderPart, blobContent, closePart]);
-
-    const uploadUrl = 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart';
-
-    const response = await fetch(uploadUrl, {
+    const metaResp = await fetch(createMetaUrl, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${this.accessToken}`,
-        'Content-Type': `multipart/related; boundary=${boundary}`,
+        'Content-Type': 'application/json; charset=UTF-8',
       },
-      body: multipartRequestBody,
+      body: JSON.stringify(metaBody),
+    });
+
+    if (!metaResp.ok) {
+      if (metaResp.status === 401) {
+        this.logout();
+        throw new Error('Authentication expired. Please reconnect to Google Drive.');
+      }
+      const errJson = await metaResp.json().catch(() => ({}));
+      throw new Error(errJson.error?.message || `Failed to create file: ${metaResp.statusText}`);
+    }
+
+    const createdFile = await metaResp.json();
+
+    // Step 2: Upload content to newly created file
+    const blobContent = content instanceof Blob ? content : new Blob([content], { type: mimeType });
+    const uploadUrl = `https://www.googleapis.com/upload/drive/v3/files/${createdFile.id}?uploadType=media`;
+
+    const uploadResp = await fetch(uploadUrl, {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${this.accessToken}`,
+        'Content-Type': mimeType || 'application/octet-stream',
+      },
+      body: blobContent,
+    });
+
+    if (!uploadResp.ok) {
+      const errJson = await uploadResp.json().catch(() => ({}));
+      throw new Error(errJson.error?.message || `Failed to upload content: ${uploadResp.statusText}`);
+    }
+
+    return {
+      id: createdFile.id,
+      name: createdFile.name,
+      mimeType: createdFile.mimeType,
+      fileType: getFileTypeFromMimeAndExt(createdFile.mimeType, createdFile.name),
+      isDemo: false,
+    };
+  }
+
+  /**
+   * Create a new folder in Google Drive
+   */
+  public async createFolder(folderName: string, parentFolderId?: string): Promise<DriveFile> {
+    if (!this.isConnected()) {
+      throw new Error('Authentication expired. Please connect to Google Drive.');
+    }
+
+    const createMetaUrl = 'https://www.googleapis.com/drive/v3/files';
+    const metaBody: any = {
+      name: folderName.trim(),
+      mimeType: 'application/vnd.google-apps.folder',
+    };
+    if (parentFolderId && parentFolderId !== 'root') {
+      metaBody.parents = [parentFolderId];
+    }
+
+    const response = await fetch(createMetaUrl, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${this.accessToken}`,
+        'Content-Type': 'application/json; charset=UTF-8',
+      },
+      body: JSON.stringify(metaBody),
     });
 
     if (!response.ok) {
+      if (response.status === 401) {
+        this.logout();
+        throw new Error('Authentication expired. Please reconnect to Google Drive.');
+      }
       const errJson = await response.json().catch(() => ({}));
-      throw new Error(errJson.error?.message || `Failed to create file in Google Drive: ${response.statusText}`);
+      throw new Error(errJson.error?.message || `Failed to create folder: ${response.statusText}`);
+    }
+
+    const created = await response.json();
+    return {
+      id: created.id,
+      name: created.name,
+      mimeType: created.mimeType,
+      fileType: 'unknown',
+      isFolder: true,
+      isDemo: false,
+      parentFolderId: parentFolderId || 'root',
+      modifiedTime: new Date().toISOString(),
+    };
+  }
+
+  /**
+   * Copy a file in Google Drive
+   */
+  public async copyFile(fileId: string, destinationFolderId?: string): Promise<DriveFile> {
+    if (!this.isConnected()) {
+      throw new Error('Authentication expired. Please connect to Google Drive.');
+    }
+
+    const copyUrl = `https://www.googleapis.com/drive/v3/files/${fileId}/copy`;
+    const copyBody: any = {};
+    if (destinationFolderId && destinationFolderId !== 'root') {
+      copyBody.parents = [destinationFolderId];
+    }
+
+    const response = await fetch(copyUrl, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${this.accessToken}`,
+        'Content-Type': 'application/json; charset=UTF-8',
+      },
+      body: JSON.stringify(copyBody),
+    });
+
+    if (!response.ok) {
+      if (response.status === 401) {
+        this.logout();
+        throw new Error('Authentication expired. Please reconnect to Google Drive.');
+      }
+      const errJson = await response.json().catch(() => ({}));
+      throw new Error(errJson.error?.message || `Failed to copy file: ${response.statusText}`);
     }
 
     const created = await response.json();
@@ -376,7 +492,76 @@ class GoogleDriveService {
       mimeType: created.mimeType,
       fileType: getFileTypeFromMimeAndExt(created.mimeType, created.name),
       isDemo: false,
+      parentFolderId: destinationFolderId || 'root',
+      modifiedTime: new Date().toISOString(),
     };
+  }
+
+  /**
+   * Move / Cut & Paste a file to another folder in Google Drive
+   */
+  public async moveFile(fileId: string, previousFolderId?: string, targetFolderId?: string): Promise<DriveFile> {
+    if (!this.isConnected()) {
+      throw new Error('Authentication expired. Please connect to Google Drive.');
+    }
+
+    let moveUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?addParents=${encodeURIComponent(targetFolderId || 'root')}`;
+    if (previousFolderId && previousFolderId !== 'root') {
+      moveUrl += `&removeParents=${encodeURIComponent(previousFolderId)}`;
+    }
+
+    const response = await fetch(moveUrl, {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${this.accessToken}`,
+      },
+    });
+
+    if (!response.ok) {
+      if (response.status === 401) {
+        this.logout();
+        throw new Error('Authentication expired. Please reconnect to Google Drive.');
+      }
+      const errJson = await response.json().catch(() => ({}));
+      throw new Error(errJson.error?.message || `Failed to move file: ${response.statusText}`);
+    }
+
+    const updated = await response.json();
+    return {
+      id: updated.id,
+      name: updated.name,
+      mimeType: updated.mimeType,
+      fileType: getFileTypeFromMimeAndExt(updated.mimeType, updated.name),
+      isDemo: false,
+      parentFolderId: targetFolderId || 'root',
+      modifiedTime: new Date().toISOString(),
+    };
+  }
+
+  /**
+   * Delete a file or folder in Google Drive
+   */
+  public async deleteFile(fileId: string): Promise<void> {
+    if (!this.isConnected()) {
+      throw new Error('Authentication expired. Please connect to Google Drive.');
+    }
+
+    const deleteUrl = `https://www.googleapis.com/drive/v3/files/${fileId}`;
+    const response = await fetch(deleteUrl, {
+      method: 'DELETE',
+      headers: {
+        Authorization: `Bearer ${this.accessToken}`,
+      },
+    });
+
+    if (!response.ok && response.status !== 204) {
+      if (response.status === 401) {
+        this.logout();
+        throw new Error('Authentication expired. Please reconnect to Google Drive.');
+      }
+      const errJson = await response.json().catch(() => ({}));
+      throw new Error(errJson.error?.message || `Failed to delete: ${response.statusText}`);
+    }
   }
 }
 
