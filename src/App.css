@@ -301,7 +301,8 @@
   flex: 1;
   display: flex;
   flex-direction: column;
-  height: calc(100vh - 56px);
+  height: 100%;
+  width: 100%;
   overflow: hidden;
   background: var(--bg-primary);
 }
@@ -318,6 +319,11 @@
   padding: 0 1rem;
   gap: 0.5rem;
   z-index: 30;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.editor-toolbar::-webkit-scrollbar {
+  display: none;
 }
 
 .toolbar-group {

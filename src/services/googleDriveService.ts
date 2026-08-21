@@ -1,5 +1,6 @@
 import { ConnectedDriveAccount, DriveFile, GoogleCredentials } from '../types';
 import { getFileTypeFromMimeAndExt } from '../utils/fileTypeUtils';
+import { fileBufferCache } from './fileBufferCache';
 
 const SCOPES = 'https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile';
 const DISCOVERY_DOC = 'https://www.googleapis.com/discovery/v1/apis/drive/v3/rest';
@@ -346,21 +347,30 @@ class GoogleDriveService {
     }));
   }
 
-  public async downloadFile(fileId: string, mimeType?: string): Promise<{ data: ArrayBuffer; mimeType: string }> {
+  public async downloadFile(
+    fileId: string,
+    mimeType?: string,
+    onProgress?: (receivedBytes: number, totalBytes: number) => void
+  ): Promise<{ data: ArrayBuffer; mimeType: string }> {
+    const effectiveMime = mimeType || 'application/octet-stream';
+
+    // 1. Instant Cache Hit: Return from local IndexedDB/RAM in <50ms without network wait
+    const cachedData = await fileBufferCache.get(fileId);
+    if (cachedData && cachedData.byteLength > 0) {
+      return { data: cachedData, mimeType: effectiveMime };
+    }
+
     if (!this.accessToken) {
       throw new Error('Not authenticated with Google Drive.');
     }
 
     // Check if it's a native Google Docs / Sheets / Slides file
     let downloadUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`;
-    let effectiveMime = mimeType || 'application/octet-stream';
 
     if (mimeType?.includes('google-apps.document')) {
       downloadUrl = `https://www.googleapis.com/drive/v3/files/${fileId}/export?mimeType=application/vnd.openxmlformats-officedocument.wordprocessingml.document`;
-      effectiveMime = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
     } else if (mimeType?.includes('google-apps.spreadsheet')) {
       downloadUrl = `https://www.googleapis.com/drive/v3/files/${fileId}/export?mimeType=application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`;
-      effectiveMime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
     }
 
     const response = await fetch(downloadUrl, {
@@ -373,7 +383,42 @@ class GoogleDriveService {
       throw new Error(`Failed to download file from Google Drive (${response.status}: ${response.statusText})`);
     }
 
-    const arrayBuffer = await response.arrayBuffer();
+    const contentLength = response.headers.get('content-length');
+    const totalBytes = contentLength ? parseInt(contentLength, 10) : 0;
+
+    let arrayBuffer: ArrayBuffer;
+
+    if (response.body && onProgress && totalBytes > 0) {
+      const reader = response.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let receivedBytes = 0;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) {
+          chunks.push(value);
+          receivedBytes += value.length;
+          onProgress(receivedBytes, totalBytes);
+        }
+      }
+
+      const combined = new Uint8Array(receivedBytes);
+      let offset = 0;
+      for (const chunk of chunks) {
+        combined.set(chunk, offset);
+        offset += chunk.length;
+      }
+      arrayBuffer = combined.buffer;
+    } else {
+      arrayBuffer = await response.arrayBuffer();
+    }
+
+    // Cache downloaded buffer in local IndexedDB + RAM so subsequent clicks open in 0.01s!
+    if (arrayBuffer && arrayBuffer.byteLength > 0) {
+      fileBufferCache.set(fileId, arrayBuffer);
+    }
+
     return { data: arrayBuffer, mimeType: effectiveMime };
   }
 

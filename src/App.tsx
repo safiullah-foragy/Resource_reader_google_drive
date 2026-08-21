@@ -14,6 +14,7 @@ import { Header } from './components/Header/Header';
 import { DriveExplorer } from './components/DriveExplorer/DriveExplorer';
 import { ToastContainer } from './components/Common/ToastContainer';
 import { SettingsModal, AppTheme } from './components/Settings/SettingsModal';
+import { UnsavedChangesModal } from './components/Common/UnsavedChangesModal';
 
 import { PdfEditor } from './components/Editors/PdfEditor/PdfEditor';
 import { ExcelEditor } from './components/Editors/ExcelEditor/ExcelEditor';
@@ -49,6 +50,16 @@ export function App() {
   // Multi-Document Tabs State
   const [openDocuments, setOpenDocuments] = useState<OpenDocument[]>([]);
   const [activeTabId, setActiveTabId] = useState<string>('explorer'); // 'explorer' or document id
+
+  // Unsaved changes confirmation modal state
+  type PendingLeaveAction =
+    | { type: 'close-tab'; docId: string; fileName: string }
+    | { type: 'switch-tab'; targetTabId: string; fromDocId: string; fileName: string }
+    | { type: 'back-to-explorer'; fromDocId: string; fileName: string };
+
+  const [pendingLeaveAction, setPendingLeaveAction] = useState<PendingLeaveAction | null>(null);
+  const [isUnsavedModalSaving, setIsUnsavedModalSaving] = useState<boolean>(false);
+  const [isHeaderCollapsed, setIsHeaderCollapsed] = useState<boolean>(false);
 
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [isConnectedToDrive, setIsConnectedToDrive] = useState<boolean>(false);
@@ -328,21 +339,32 @@ export function App() {
     openingFilesRef.current.add(file.id);
 
     setIsLoading(true);
+    showToast('info', 'Loading Document', `Accessing "${file.name}"...`);
+
     try {
       let buffer: ArrayBuffer;
       let initialBlob: Blob;
 
       if (file.rawBlob) {
         initialBlob = file.rawBlob;
-        buffer = file.rawArrayBuffer || (await blobToArrayBuffer(initialBlob));
+        buffer = file.rawArrayBuffer || (await file.rawBlob.arrayBuffer());
       } else if (file.fileHandle && typeof file.fileHandle.getFile === 'function') {
         const localFile = await file.fileHandle.getFile();
+        initialBlob = localFile;
         buffer = await localFile.arrayBuffer();
-        initialBlob = new Blob([buffer], { type: localFile.type || file.mimeType || 'application/octet-stream' });
       } else if (file.isLocal || file.id.startsWith('local_')) {
         throw new Error('Local file content could not be accessed.');
       } else {
-        const { data } = await googleDriveService.downloadFile(file.id, file.mimeType);
+        const { data } = await googleDriveService.downloadFile(
+          file.id,
+          file.mimeType,
+          (received, total) => {
+            const pct = Math.round((received / total) * 100);
+            const mbRec = (received / (1024 * 1024)).toFixed(1);
+            const mbTotal = (total / (1024 * 1024)).toFixed(1);
+            showToast('info', 'Downloading File', `${mbRec} MB / ${mbTotal} MB (${pct}%)`);
+          }
+        );
         buffer = data;
         initialBlob = new Blob([buffer], { type: file.mimeType });
       }
@@ -364,7 +386,7 @@ export function App() {
         return [...prev, newDoc];
       });
       setActiveTabId(file.id);
-      showToast('info', `Opened ${file.name}`, `Ready in tab.`);
+      showToast('success', `Opened ${file.name}`, `Ready in tab.`);
     } catch (err: any) {
       console.error('Failed to open file:', err);
       showToast('error', 'Failed to Open File', err.message || 'Could not fetch file content.');
@@ -374,16 +396,8 @@ export function App() {
     }
   };
 
-  // Close a Document Tab
-  const handleCloseTab = (e: React.MouseEvent, docId: string) => {
-    e.stopPropagation();
-
-    const docToClose = openDocuments.find((d) => d.id === docId);
-    if (docToClose?.hasUnsavedChanges) {
-      const confirmDiscard = window.confirm(`"${docToClose.file.name}" has unsaved changes. Close tab anyway?`);
-      if (!confirmDiscard) return;
-    }
-
+  // Execute Closing a Document Tab
+  const executeCloseTab = (docId: string) => {
     const remainingDocs = openDocuments.filter((d) => d.id !== docId);
     setOpenDocuments(remainingDocs);
 
@@ -395,6 +409,121 @@ export function App() {
       }
     }
   };
+
+  // Close a Document Tab (Intercepts with Unsaved Changes Modal)
+  const handleCloseTab = (e: React.MouseEvent, docId: string) => {
+    e.stopPropagation();
+
+    const docToClose = openDocuments.find((d) => d.id === docId);
+    if (docToClose?.hasUnsavedChanges) {
+      setPendingLeaveAction({
+        type: 'close-tab',
+        docId,
+        fileName: docToClose.file.name,
+      });
+      return;
+    }
+
+    executeCloseTab(docId);
+  };
+
+  // Switch Tab (Intercepts if active document has unsaved updates)
+  const handleRequestSelectTab = (targetTabId: string) => {
+    if (targetTabId === activeTabId) return;
+
+    if (activeDocument?.hasUnsavedChanges && targetTabId !== activeDocument.id) {
+      setPendingLeaveAction({
+        type: 'switch-tab',
+        targetTabId,
+        fromDocId: activeDocument.id,
+        fileName: activeDocument.file.name,
+      });
+      return;
+    }
+
+    setActiveTabId(targetTabId);
+  };
+
+  // Back to Files / Explorer (Intercepts if active document has unsaved updates)
+  const handleRequestBackToExplorer = () => {
+    if (activeDocument?.hasUnsavedChanges) {
+      setPendingLeaveAction({
+        type: 'back-to-explorer',
+        fromDocId: activeDocument.id,
+        fileName: activeDocument.file.name,
+      });
+      return;
+    }
+
+    setActiveTabId('explorer');
+  };
+
+  // Unsaved Changes Modal Option 1: Save & Continue
+  const handleModalSaveAndContinue = async () => {
+    if (!pendingLeaveAction) return;
+
+    setIsUnsavedModalSaving(true);
+    try {
+      await handleSaveToDrive();
+      const action = pendingLeaveAction;
+      setPendingLeaveAction(null);
+
+      if (action.type === 'close-tab') {
+        executeCloseTab(action.docId);
+      } else if (action.type === 'switch-tab') {
+        setActiveTabId(action.targetTabId);
+      } else if (action.type === 'back-to-explorer') {
+        setActiveTabId('explorer');
+      }
+    } catch (err: any) {
+      console.error('Save before leaving failed:', err);
+      showToast('error', 'Save Failed', err.message || 'Could not save before leaving.');
+    } finally {
+      setIsUnsavedModalSaving(false);
+    }
+  };
+
+  // Unsaved Changes Modal Option 2: Continue without Saving (Discard)
+  const handleModalContinueWithoutSaving = () => {
+    if (!pendingLeaveAction) return;
+
+    const action = pendingLeaveAction;
+    if (action.type === 'close-tab') {
+      executeCloseTab(action.docId);
+    } else if (action.type === 'switch-tab') {
+      setOpenDocuments((prev) =>
+        prev.map((d) => (d.id === action.fromDocId ? { ...d, hasUnsavedChanges: false, saveStatus: 'idle' } : d))
+      );
+      setActiveTabId(action.targetTabId);
+    } else if (action.type === 'back-to-explorer') {
+      setOpenDocuments((prev) =>
+        prev.map((d) => (d.id === action.fromDocId ? { ...d, hasUnsavedChanges: false, saveStatus: 'idle' } : d))
+      );
+      setActiveTabId('explorer');
+    }
+
+    setPendingLeaveAction(null);
+  };
+
+  // Unsaved Changes Modal Option 3: Close (Stay Here)
+  const handleModalClose = () => {
+    setPendingLeaveAction(null);
+  };
+
+  // Warn on browser reload / tab close when unsaved documents exist
+  useEffect(() => {
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      const hasAnyUnsaved = openDocuments.some((d) => d.hasUnsavedChanges);
+      if (hasAnyUnsaved) {
+        e.preventDefault();
+        e.returnValue = 'This will lose your unsaved updates. Are you sure you want to leave?';
+        return e.returnValue;
+      }
+    };
+
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [openDocuments]);
 
   // Handle Binary Modification from any editor
   const handleEditorModify = (newBlob: Blob) => {
@@ -972,7 +1101,6 @@ export function App() {
   const handleUploadLocalFile = async (uploadedFile: File) => {
     try {
       const buffer = await uploadedFile.arrayBuffer();
-      const blob = new Blob([buffer], { type: uploadedFile.type });
       const fileType = getFileTypeFromMimeAndExt(uploadedFile.type, uploadedFile.name);
 
       const localDriveFile: DriveFile = {
@@ -984,7 +1112,7 @@ export function App() {
         modifiedTime: new Date(uploadedFile.lastModified).toISOString(),
         isLocal: true,
         parentFolderId: currentFolderId,
-        rawBlob: blob,
+        rawBlob: uploadedFile,
         rawArrayBuffer: buffer,
       };
 
@@ -1063,35 +1191,38 @@ export function App() {
 
   return (
     <div className="app-container">
-      {/* Top Browser-style Tab Bar */}
-      <TabBar
-        openDocuments={openDocuments}
-        activeTabId={activeTabId}
-        connectedAccounts={connectedAccounts}
-        activeAccountId={activeAccountId}
-        onSelectTab={(tabId) => setActiveTabId(tabId)}
-        onSelectAccount={handleSelectAccount}
-        onAddAccount={handleAddAccount}
-        onRemoveAccount={handleRemoveAccount}
-        onCloseTab={handleCloseTab}
-        onOpenExplorer={() => setActiveTabId('explorer')}
-      />
+      {/* Top Browser-style Tab Bar & Header (Collapsible for Clean Reading Focus) */}
+      {!isHeaderCollapsed && (
+        <>
+          <TabBar
+            openDocuments={openDocuments}
+            activeTabId={activeTabId}
+            connectedAccounts={connectedAccounts}
+            activeAccountId={activeAccountId}
+            onSelectTab={handleRequestSelectTab}
+            onSelectAccount={handleSelectAccount}
+            onAddAccount={handleAddAccount}
+            onRemoveAccount={handleRemoveAccount}
+            onCloseTab={handleCloseTab}
+            onOpenExplorer={handleRequestBackToExplorer}
+          />
 
-      {/* Header with Save & Action Controls */}
-      <Header
-        activeFile={activeDocument?.file || null}
-        saveStatus={activeDocument?.saveStatus || 'idle'}
-        hasUnsavedChanges={activeDocument?.hasUnsavedChanges || false}
-        onBackToExplorer={() => setActiveTabId('explorer')}
-        onSaveToDrive={handleSaveToDrive}
-        onSaveAsCopy={handleSaveAsCopy}
-        onDownloadLocal={handleDownloadLocal}
-        onRenameFile={handleRenameFile}
-        isDarkMode={currentTheme !== 'light'}
-        onToggleTheme={handleToggleTheme}
-        onOpenSettings={() => setIsSettingsOpen(true)}
-        isConnectedToDrive={isConnectedToDrive}
-      />
+          <Header
+            activeFile={activeDocument?.file || null}
+            saveStatus={activeDocument?.saveStatus || 'idle'}
+            hasUnsavedChanges={activeDocument?.hasUnsavedChanges || false}
+            onBackToExplorer={handleRequestBackToExplorer}
+            onSaveToDrive={handleSaveToDrive}
+            onSaveAsCopy={handleSaveAsCopy}
+            onDownloadLocal={handleDownloadLocal}
+            onRenameFile={handleRenameFile}
+            isDarkMode={currentTheme !== 'light'}
+            onToggleTheme={handleToggleTheme}
+            onOpenSettings={() => setIsSettingsOpen(true)}
+            isConnectedToDrive={isConnectedToDrive}
+          />
+        </>
+      )}
 
       {/* Main View Area */}
       <main className="app-main">
@@ -1135,6 +1266,8 @@ export function App() {
                 arrayBuffer={activeDocument.arrayBuffer}
                 onModify={handleEditorModify}
                 onHasUnsavedChanges={handleSetHasUnsavedChanges}
+                isHeaderCollapsed={isHeaderCollapsed}
+                onToggleCollapseHeader={() => setIsHeaderCollapsed((prev) => !prev)}
               />
             )}
 
@@ -1194,6 +1327,16 @@ export function App() {
         connectedAccounts={connectedAccounts}
         onDisconnectAccount={(accId) => handleRemoveAccount({ stopPropagation: () => {} } as any, accId)}
         onDisconnectAll={handleDisconnectAll}
+      />
+
+      {/* Unsaved Changes Confirmation Modal */}
+      <UnsavedChangesModal
+        isOpen={Boolean(pendingLeaveAction)}
+        fileName={pendingLeaveAction?.fileName || ''}
+        onSaveAndContinue={handleModalSaveAndContinue}
+        onContinueWithoutSaving={handleModalContinueWithoutSaving}
+        onClose={handleModalClose}
+        isSaving={isUnsavedModalSaving}
       />
 
       {/* Toast Notifications */}

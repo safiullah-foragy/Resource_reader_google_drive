@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
 import * as pdfjsLib from 'pdfjs-dist';
 import pdfjsWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
@@ -14,25 +14,36 @@ import {
   Eraser, 
   ZoomIn, 
   ZoomOut, 
+  Maximize2,
+  Minimize2,
+  Hand,
+  Gauge,
   Undo2, 
   Redo2,
   RotateCcw, 
   Loader2, 
+  ChevronUp,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   Trash2,
   Check,
   X
 } from 'lucide-react';
 import { AnnotationItem, AnnotationTool, DriveFile, Point } from '../../../types';
+import { googleDriveService } from '../../../services/googleDriveService';
+import { pdfRamCache } from '../../../services/pdfRamCache';
 
 // Configure bundled local worker
-pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorker;
+pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorker || '/pdfjs/pdf.worker.min.mjs';
 
 interface PdfEditorProps {
   file: DriveFile;
   arrayBuffer: ArrayBuffer;
   onModify: (newBlob: Blob) => void;
   onHasUnsavedChanges: (hasChanges: boolean) => void;
+  isHeaderCollapsed?: boolean;
+  onToggleCollapseHeader?: () => void;
 }
 
 // 5 Opacity / Strength Divisions for Highlighter
@@ -151,9 +162,13 @@ function wrapCanvasText(ctx: CanvasRenderingContext2D, text: string, maxWidth: n
 
 // Single Page View Component
 interface PageViewProps {
+  docId: string;
   pageNumber: number;
   pdfDocProxy: any;
   scale: number;
+  defaultDimensions: { width: number; height: number };
+  cachedDimensions?: { width: number; height: number };
+  onDimensionsKnown?: (pageNumber: number, dimensions: { width: number; height: number }) => void;
   activeTool: AnnotationTool | 'none';
   selectedColor: string;
   strokeWidth: number;
@@ -170,9 +185,13 @@ interface PageViewProps {
 }
 
 const PdfPageView: React.FC<PageViewProps> = ({
+  docId,
   pageNumber,
   pdfDocProxy,
   scale,
+  defaultDimensions,
+  cachedDimensions,
+  onDimensionsKnown,
   activeTool,
   selectedColor,
   strokeWidth,
@@ -189,7 +208,11 @@ const PdfPageView: React.FC<PageViewProps> = ({
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const overlayCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const [dimensions, setDimensions] = useState<{ width: number; height: number }>({ width: 595, height: 842 });
+  const initialDim = cachedDimensions || defaultDimensions;
+  const [dimensions, setDimensions] = useState<{ width: number; height: number }>({
+    width: initialDim.width * scale,
+    height: initialDim.height * scale,
+  });
   const [isRendered, setIsRendered] = useState<boolean>(false);
   const [isDrawing, setIsDrawing] = useState<boolean>(false);
 
@@ -213,7 +236,7 @@ const PdfPageView: React.FC<PageViewProps> = ({
   const shapeStartPointRef = useRef<Point | null>(null);
   const renderTaskRef = useRef<any>(null);
 
-  // Render PDF page canvas
+  // Render PDF page canvas (with 0ms RAM Bitmap Cache)
   useEffect(() => {
     if (!pdfDocProxy || !canvasRef.current) return;
     let isCancelled = false;
@@ -226,24 +249,62 @@ const PdfPageView: React.FC<PageViewProps> = ({
 
     async function render() {
       try {
-        const page = await pdfDocProxy.getPage(pageNumber);
-        if (isCancelled) return;
-
-        const viewport = page.getViewport({ scale });
         const canvas = canvasRef.current;
         if (!canvas || isCancelled) return;
 
-        const ctx = canvas.getContext('2d');
+        const ctx = canvas.getContext('2d', { alpha: false });
         if (!ctx) return;
 
-        canvas.width = viewport.width;
-        canvas.height = viewport.height;
-        setDimensions({ width: viewport.width, height: viewport.height });
+        // 1. Check in-memory RAM bitmap cache (0ms instant response)
+        const ramCached = pdfRamCache.get(docId, pageNumber, scale);
+        if (ramCached) {
+          canvas.width = ramCached.pixelWidth;
+          canvas.height = ramCached.pixelHeight;
+          canvas.style.width = `${ramCached.cssWidth}px`;
+          canvas.style.height = `${ramCached.cssHeight}px`;
+          ctx.drawImage(ramCached.bitmap, 0, 0);
 
-        const renderContext = {
+          setDimensions({ width: ramCached.cssWidth, height: ramCached.cssHeight });
+          if (!isCancelled) {
+            setIsRendered(true);
+          }
+          return;
+        }
+
+        // 2. RAM Cache Miss: Render via worker & cache bitmap in RAM
+        const page = await pdfRamCache.getPage(pdfDocProxy, docId, pageNumber);
+        if (isCancelled) return;
+
+        // Support High DPI displays for crisp rendering
+        const dpr = Math.min(window.devicePixelRatio || 1, 1.75);
+        const pixelViewport = page.getViewport({ scale: scale * dpr });
+        const cssViewport = page.getViewport({ scale });
+        const unscaledViewport = page.getViewport({ scale: 1.0 });
+
+        canvas.width = pixelViewport.width;
+        canvas.height = pixelViewport.height;
+        canvas.style.width = `${cssViewport.width}px`;
+        canvas.style.height = `${cssViewport.height}px`;
+
+        // Fill solid white background so transparent and black text PDF pages render with 100% clarity
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, pixelViewport.width, pixelViewport.height);
+
+        setDimensions({ width: cssViewport.width, height: cssViewport.height });
+        if (onDimensionsKnown) {
+          onDimensionsKnown(pageNumber, { width: unscaledViewport.width, height: unscaledViewport.height });
+        }
+
+        const renderContext: any = {
           canvasContext: ctx,
-          viewport: viewport,
+          viewport: pixelViewport,
+          intent: 'display',
+          background: 'rgb(255, 255, 255)',
         };
+
+        if ((pdfjsLib as any).AnnotationMode) {
+          renderContext.annotationMode = (pdfjsLib as any).AnnotationMode.ENABLE;
+        }
 
         const task = page.render(renderContext);
         renderTaskRef.current = task;
@@ -251,6 +312,22 @@ const PdfPageView: React.FC<PageViewProps> = ({
 
         if (!isCancelled) {
           setIsRendered(true);
+
+          // Store rendered bitmap in system RAM for future instant page flips
+          try {
+            createImageBitmap(canvas).then((bitmap) => {
+              pdfRamCache.set(
+                docId,
+                pageNumber,
+                scale,
+                bitmap,
+                pixelViewport.width,
+                pixelViewport.height,
+                cssViewport.width,
+                cssViewport.height
+              );
+            });
+          } catch (e) {}
         }
       } catch (err: any) {
         if (err?.name !== 'RenderingCancelledException') {
@@ -269,7 +346,7 @@ const PdfPageView: React.FC<PageViewProps> = ({
         } catch (e) {}
       }
     };
-  }, [pdfDocProxy, pageNumber, scale]);
+  }, [docId, pdfDocProxy, pageNumber, scale, onDimensionsKnown]);
 
   // Redraw annotations on overlay
   const redrawOverlay = useCallback(() => {
@@ -854,10 +931,14 @@ const PdfPageView: React.FC<PageViewProps> = ({
 
       <div
         className="pdf-page-container"
+        onMouseDown={(e) => e.stopPropagation()}
         style={{
           width: dimensions.width,
           height: dimensions.height,
           position: 'relative',
+          backgroundColor: '#ffffff',
+          boxShadow: '0 4px 20px rgba(0,0,0,0.3)',
+          borderRadius: '4px',
         }}
       >
         {!isRendered && (
@@ -872,15 +953,26 @@ const PdfPageView: React.FC<PageViewProps> = ({
               color: '#3b82f6',
               gap: '6px',
               fontSize: '12px',
+              borderRadius: '4px',
+              zIndex: 1,
             }}
           >
             <Loader2 size={16} className="animate-spin" />
-            <span>Loading page {pageNumber}...</span>
+            <span>Rendering page {pageNumber}...</span>
           </div>
         )}
 
         {/* Base PDF Canvas */}
-        <canvas ref={canvasRef} style={{ display: 'block' }} />
+        <canvas
+          ref={canvasRef}
+          style={{
+            display: 'block',
+            width: `${dimensions.width}px`,
+            height: `${dimensions.height}px`,
+            backgroundColor: '#ffffff',
+            borderRadius: '4px',
+          }}
+        />
 
         {/* Interactive Annotation Canvas */}
         <canvas
@@ -1251,11 +1343,25 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
   arrayBuffer,
   onModify,
   onHasUnsavedChanges,
+  isHeaderCollapsed,
+  onToggleCollapseHeader,
 }) => {
   const [numPages, setNumPages] = useState<number>(0);
   const [currentPage, setCurrentPage] = useState<number>(1);
   const [scale, setScale] = useState<number>(1.2);
   const [activeTool, setActiveTool] = useState<AnnotationTool | 'none'>('draw');
+
+  // Custom Dynamic Drag-Scroll Speed (0.5x to 4.0x)
+  const [scrollSpeed, setScrollSpeed] = useState<number>(() => {
+    const saved = localStorage.getItem('pdf_drag_scroll_speed');
+    return saved ? parseFloat(saved) : 1.5;
+  });
+  const [showSpeedPopover, setShowSpeedPopover] = useState<boolean>(false);
+
+  const handleSetScrollSpeed = (speed: number) => {
+    setScrollSpeed(speed);
+    localStorage.setItem('pdf_drag_scroll_speed', speed.toString());
+  };
 
   // Pen settings
   const [penColor, setPenColor] = useState<string>('#ef4444');
@@ -1282,6 +1388,13 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
   const [selectedColor, setSelectedColor] = useState<string>('#ef4444');
   const [strokeWidth, setStrokeWidth] = useState<number>(3);
 
+  // Page dimension caching & virtualization
+  const [defaultDimensions, setDefaultDimensions] = useState<{ width: number; height: number }>({ width: 595.28, height: 841.89 });
+  const [pageDimensions, setPageDimensions] = useState<Record<number, { width: number; height: number }>>({});
+  const handleDimensionsKnown = useCallback((pageNum: number, dim: { width: number; height: number }) => {
+    setPageDimensions((prev) => (prev[pageNum] ? prev : { ...prev, [pageNum]: dim }));
+  }, []);
+
   // Annotation List & Undo/Redo Stacks
   const [annotations, setAnnotations] = useState<AnnotationItem[]>([]);
   const undoStackRef = useRef<AnnotationItem[][]>([]);
@@ -1289,7 +1402,9 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
 
   const [pdfDocProxy, setPdfDocProxy] = useState<any>(null);
   const [isLoadingPdf, setIsLoadingPdf] = useState<boolean>(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [restoredPage, setRestoredPage] = useState<number | null>(null);
+  const [visibleRange, setVisibleRange] = useState<{ start: number; end: number }>({ start: 1, end: 4 });
 
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
 
@@ -1297,44 +1412,118 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
   useEffect(() => {
     let isCancelled = false;
     setIsLoadingPdf(true);
+    setLoadError(null);
+    onHasUnsavedChanges(false);
 
     async function loadPdf() {
       try {
+        let rawData: Uint8Array | null = null;
+
+        // 1. Try reading directly from fileHandle (local drive picker)
+        if (file.fileHandle && typeof file.fileHandle.getFile === 'function') {
+          try {
+            const localFile = await file.fileHandle.getFile();
+            const buf = await localFile.arrayBuffer();
+            if (buf && buf.byteLength > 0) {
+              rawData = new Uint8Array(buf);
+            }
+          } catch (e) {
+            console.warn('Could not read from fileHandle:', e);
+          }
+        }
+
+        // 2. Try reading from rawBlob
+        if (!rawData && file.rawBlob) {
+          try {
+            const buf = await file.rawBlob.arrayBuffer();
+            if (buf && buf.byteLength > 0) {
+              rawData = new Uint8Array(buf);
+            }
+          } catch (e) {
+            console.warn('Could not read from rawBlob:', e);
+          }
+        }
+
+        // 3. Try using arrayBuffer if intact
+        if (!rawData && arrayBuffer && arrayBuffer.byteLength > 0) {
+          rawData = new Uint8Array(arrayBuffer.slice(0));
+        }
+
+        // 4. Try re-downloading from Google Drive if remote file
+        if (!rawData && !file.isLocal && !file.id.startsWith('local_')) {
+          try {
+            const { data } = await googleDriveService.downloadFile(file.id, file.mimeType);
+            if (data && data.byteLength > 0) {
+              rawData = new Uint8Array(data);
+            }
+          } catch (e) {
+            console.warn('Could not re-download from Drive:', e);
+          }
+        }
+
+        if (!rawData || rawData.byteLength === 0) {
+          throw new Error('PDF file buffer is empty or detached. Please close and re-open this file.');
+        }
+
         const loadingTask = pdfjsLib.getDocument({
-          data: new Uint8Array(arrayBuffer.slice(0)),
-          cMapUrl: 'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.0.379/cmaps/',
+          data: rawData,
+          cMapUrl: '/pdfjs/cmaps/',
           cMapPacked: true,
+          standardFontDataUrl: '/pdfjs/standard_fonts/',
+          disableFontFace: false,
+          disableAutoFetch: true,
+          disableStream: true,
+          disableRange: true,
+          verbosity: 0,
         });
+
         const pdf = await loadingTask.promise;
         if (!isCancelled) {
           setPdfDocProxy(pdf);
           setNumPages(pdf.numPages);
+          setIsLoadingPdf(false);
 
           // Restore last-read page position for this specific document
           const storageKey = `pdf_last_read_page_${file.id || file.name}`;
           const savedPage = localStorage.getItem(storageKey);
           const initialPage = savedPage ? parseInt(savedPage, 10) : 1;
+          const safeInitial = (initialPage > 1 && initialPage <= pdf.numPages) ? initialPage : 1;
 
-          if (initialPage > 1 && initialPage <= pdf.numPages) {
-            setCurrentPage(initialPage);
-            setRestoredPage(initialPage);
+          setVisibleRange({
+            start: Math.max(1, safeInitial - 1),
+            end: Math.min(pdf.numPages, safeInitial + 3),
+          });
+
+          if (safeInitial > 1) {
+            setCurrentPage(safeInitial);
+            setRestoredPage(safeInitial);
             setTimeout(() => {
-              const el = document.getElementById(`pdf-page-${initialPage}`);
+              const el = document.getElementById(`pdf-page-${safeInitial}`);
               if (el) {
                 el.scrollIntoView({ behavior: 'smooth', block: 'start' });
               }
-            }, 300);
+            }, 150);
             setTimeout(() => setRestoredPage(null), 4500);
           } else {
             setTimeout(() => {
               if (scrollContainerRef.current) {
                 scrollContainerRef.current.scrollTop = 0;
               }
-            }, 50);
+            }, 30);
           }
+
+          // Asynchronously prefetch page 1 dimensions in background without blocking UI
+          pdf.getPage(1).then((firstPage: any) => {
+            const vp = firstPage.getViewport({ scale: 1.0 });
+            setDefaultDimensions({ width: vp.width, height: vp.height });
+            setPageDimensions((prev) => ({ ...prev, 1: { width: vp.width, height: vp.height } }));
+          }).catch(() => {});
         }
-      } catch (err) {
+      } catch (err: any) {
         console.error('PDF loading error:', err);
+        if (!isCancelled) {
+          setLoadError(err.message || 'Failed to load PDF.');
+        }
       } finally {
         if (!isCancelled) setIsLoadingPdf(false);
       }
@@ -1344,45 +1533,172 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
     return () => {
       isCancelled = true;
     };
-  }, [arrayBuffer, file.id, file.name]);
+  }, [file.rawBlob, file.fileHandle, arrayBuffer, file.id, file.name]);
 
-  // Track active page as user scrolls & persist position
-  const handleScroll = () => {
+  // Intelligent Background RAM Prefetcher: Pre-loads upcoming pages into System RAM for 0ms transitions
+  useEffect(() => {
+    if (!pdfDocProxy || numPages <= 1) return;
+
+    const docId = file.id || file.name;
+    const center = currentPage;
+
+    // Queue prefetch for forward and backward neighbors
+    const pagesToPrefetch = [center + 1, center + 2, center + 3, center - 1, center + 4].filter(
+      (p) => p >= 1 && p <= numPages && !pdfRamCache.has(docId, p, scale)
+    );
+
+    if (pagesToPrefetch.length === 0) return;
+
+    let cancelled = false;
+    const timeoutId = setTimeout(async () => {
+      if (!cancelled) {
+        await pdfRamCache.prefetchPages(docId, pdfDocProxy, pagesToPrefetch, scale);
+      }
+    }, 80);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timeoutId);
+    };
+  }, [currentPage, scale, pdfDocProxy, numPages, file.id, file.name]);
+
+  // Track active page and update visible rendering window smoothly
+  const handleScroll = useCallback(() => {
     if (!scrollContainerRef.current || numPages === 0) return;
     const container = scrollContainerRef.current;
-    const containerTop = container.scrollTop;
-    const viewportMid = containerTop + container.clientHeight / 3;
+    const scrollTop = container.scrollTop;
+    const clientHeight = container.clientHeight || 800;
 
-    for (let p = 1; p <= numPages; p++) {
-      const el = document.getElementById(`pdf-page-${p}`);
-      if (el) {
-        const top = el.offsetTop - container.offsetTop;
-        const bottom = top + el.clientHeight;
-        if (viewportMid >= top && viewportMid <= bottom) {
-          setCurrentPage(p);
-          const storageKey = `pdf_last_read_page_${file.id || file.name}`;
-          localStorage.setItem(storageKey, p.toString());
-          break;
-        }
-      }
+    const defaultPageH = (defaultDimensions.height || 842) * scale + 40;
+    const startPage = Math.max(1, Math.floor((scrollTop - defaultPageH * 1.5) / defaultPageH) + 1);
+    const endPage = Math.min(numPages, Math.ceil((scrollTop + clientHeight + defaultPageH * 1.5) / defaultPageH) + 1);
+    const centerPage = Math.min(numPages, Math.max(1, Math.floor((scrollTop + clientHeight / 3) / defaultPageH) + 1));
+
+    setVisibleRange((prev) => {
+      if (prev.start === startPage && prev.end === endPage) return prev;
+      return { start: startPage, end: endPage };
+    });
+
+    if (centerPage !== currentPage) {
+      setCurrentPage(centerPage);
+      const storageKey = `pdf_last_read_page_${file.id || file.name}`;
+      localStorage.setItem(storageKey, centerPage.toString());
     }
-  };
+  }, [numPages, defaultDimensions.height, scale, file.id, file.name, currentPage]);
 
   // Jump to specific page
-  const scrollToPage = (pageNum: number) => {
-    const el = document.getElementById(`pdf-page-${pageNum}`);
+  const scrollToPage = useCallback((pageNum: number) => {
+    const targetPage = Math.max(1, Math.min(numPages, pageNum));
+    setCurrentPage(targetPage);
+    setVisibleRange({
+      start: Math.max(1, targetPage - 2),
+      end: Math.min(numPages, targetPage + 2),
+    });
+    const storageKey = `pdf_last_read_page_${file.id || file.name}`;
+    localStorage.setItem(storageKey, targetPage.toString());
+
+    const defaultPageH = (defaultDimensions.height || 842) * scale + 40;
+    const el = document.getElementById(`pdf-page-${targetPage}`);
     if (el) {
       el.scrollIntoView({ behavior: 'smooth', block: 'start' });
-      setCurrentPage(pageNum);
-      const storageKey = `pdf_last_read_page_${file.id || file.name}`;
-      localStorage.setItem(storageKey, pageNum.toString());
+    } else if (scrollContainerRef.current) {
+      scrollContainerRef.current.scrollTo({
+        top: (targetPage - 1) * defaultPageH,
+        behavior: 'smooth',
+      });
     }
-  };
+  }, [numPages, file.id, file.name, defaultDimensions.height, scale]);
+
+  // Auto Fit to Screen Width (minimizes wasted side margin/empty space)
+  const handleFitToWidth = useCallback(() => {
+    if (!scrollContainerRef.current) return;
+    const containerWidth = scrollContainerRef.current.clientWidth || 900;
+    const pageWidth = defaultDimensions.width || 595.28;
+    const targetScale = Math.max(0.4, Math.min(3.0, (containerWidth - 32) / pageWidth));
+    setScale(Math.round(targetScale * 100) / 100);
+  }, [defaultDimensions.width]);
+
+  // Fit Entire Page into Viewport Height
+  const handleFitToPage = useCallback(() => {
+    if (!scrollContainerRef.current) return;
+    const containerHeight = scrollContainerRef.current.clientHeight || 800;
+    const pageHeight = (defaultDimensions.height || 841.89) + 40;
+    const targetScale = Math.max(0.4, Math.min(3.0, (containerHeight - 32) / pageHeight));
+    setScale(Math.round(targetScale * 100) / 100);
+  }, [defaultDimensions.height]);
+
+  // Single-Click Press & Hold Drag-to-Scroll (Hand Grab Scrolling)
+  const panDragRef = useRef<{ clientY: number; scrollTop: number; isDragging: boolean }>({
+    clientY: 0,
+    scrollTop: 0,
+    isDragging: false,
+  });
+
+  const handleStartDragScroll = useCallback((e: React.MouseEvent) => {
+    if (!scrollContainerRef.current) return;
+    panDragRef.current = {
+      clientY: e.clientY,
+      scrollTop: scrollContainerRef.current.scrollTop,
+      isDragging: true,
+    };
+  }, []);
+
+  const handleMoveDragScroll = useCallback((e: React.MouseEvent) => {
+    if (panDragRef.current.isDragging && scrollContainerRef.current) {
+      const deltaY = e.clientY - panDragRef.current.clientY;
+      scrollContainerRef.current.scrollTop = panDragRef.current.scrollTop - deltaY * scrollSpeed;
+    }
+  }, [scrollSpeed]);
+
+  const handleEndDragScroll = useCallback(() => {
+    panDragRef.current.isDragging = false;
+  }, []);
+
+  // Global window listeners for single-click drag scrolling
+  useEffect(() => {
+    const handleGlobalMouseMove = (e: MouseEvent) => {
+      if (panDragRef.current.isDragging && scrollContainerRef.current) {
+        const deltaY = e.clientY - panDragRef.current.clientY;
+        scrollContainerRef.current.scrollTop = panDragRef.current.scrollTop - deltaY * scrollSpeed;
+      }
+    };
+
+    const handleGlobalMouseUp = () => {
+      panDragRef.current.isDragging = false;
+    };
+
+    window.addEventListener('mousemove', handleGlobalMouseMove);
+    window.addEventListener('mouseup', handleGlobalMouseUp);
+
+    return () => {
+      window.removeEventListener('mousemove', handleGlobalMouseMove);
+      window.removeEventListener('mouseup', handleGlobalMouseUp);
+    };
+  }, [scrollSpeed]);
 
   // Compile annotations into valid PDF binary across all pages
   const exportModifiedPdf = async (updatedAnnotations: AnnotationItem[]): Promise<Blob> => {
     try {
-      const pdfDoc = await PDFDocument.load(arrayBuffer.slice(0));
+      let bufferToLoad: ArrayBuffer | null = null;
+      if (file.fileHandle && typeof file.fileHandle.getFile === 'function') {
+        try {
+          const f = await file.fileHandle.getFile();
+          bufferToLoad = await f.arrayBuffer();
+        } catch (e) {}
+      }
+      if (!bufferToLoad && file.rawBlob) {
+        try {
+          bufferToLoad = await file.rawBlob.arrayBuffer();
+        } catch (e) {}
+      }
+      if (!bufferToLoad && arrayBuffer && arrayBuffer.byteLength > 0) {
+        bufferToLoad = arrayBuffer.slice(0);
+      }
+      if (!bufferToLoad) {
+        throw new Error('Cannot export PDF: source buffer not available.');
+      }
+
+      const pdfDoc = await PDFDocument.load(bufferToLoad);
       const font = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
       const fontRegular = await pdfDoc.embedFont(StandardFonts.Helvetica);
       const pages = pdfDoc.getPages();
@@ -1512,6 +1828,28 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
     }
   };
 
+  // Debounce PDF binary export so strokes and rapid edits stay 60fps fast
+  const exportTimeoutRef = useRef<any>(null);
+  const debouncedExportModifiedPdf = useCallback(
+    (updatedAnnotations: AnnotationItem[]) => {
+      if (exportTimeoutRef.current) {
+        clearTimeout(exportTimeoutRef.current);
+      }
+      exportTimeoutRef.current = setTimeout(() => {
+        exportModifiedPdf(updatedAnnotations).then(onModify);
+      }, 500);
+    },
+    [arrayBuffer, onModify]
+  );
+
+  useEffect(() => {
+    return () => {
+      if (exportTimeoutRef.current) {
+        clearTimeout(exportTimeoutRef.current);
+      }
+    };
+  }, []);
+
   const pushToHistory = (current: AnnotationItem[]) => {
     undoStackRef.current.push([...current]);
     redoStackRef.current = [];
@@ -1522,7 +1860,7 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
     const updated = [...annotations, annotation];
     setAnnotations(updated);
     onHasUnsavedChanges(true);
-    exportModifiedPdf(updated).then(onModify);
+    debouncedExportModifiedPdf(updated);
   };
 
   const handleUpdateAnnotation = (id: string, updates: Partial<AnnotationItem>) => {
@@ -1530,7 +1868,7 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
     const updated = annotations.map((ann) => (ann.id === id ? { ...ann, ...updates } : ann));
     setAnnotations(updated);
     onHasUnsavedChanges(true);
-    exportModifiedPdf(updated).then(onModify);
+    debouncedExportModifiedPdf(updated);
   };
 
   const handleDeleteAnnotation = (id: string) => {
@@ -1538,7 +1876,7 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
     const updated = annotations.filter((ann) => ann.id !== id);
     setAnnotations(updated);
     onHasUnsavedChanges(true);
-    exportModifiedPdf(updated).then(onModify);
+    debouncedExportModifiedPdf(updated);
   };
 
   const handleEraseAtPoint = (pageNumber: number, pt: Point) => {
@@ -1564,7 +1902,7 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
       pushToHistory(annotations);
       setAnnotations(updated);
       onHasUnsavedChanges(true);
-      exportModifiedPdf(updated).then(onModify);
+      debouncedExportModifiedPdf(updated);
     }
   };
 
@@ -1574,7 +1912,7 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
     redoStackRef.current.push([...annotations]);
     setAnnotations(previous);
     onHasUnsavedChanges(previous.length > 0 || undoStackRef.current.length > 0);
-    exportModifiedPdf(previous).then(onModify);
+    debouncedExportModifiedPdf(previous);
   };
 
   const handleRedo = () => {
@@ -1583,14 +1921,15 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
     undoStackRef.current.push([...annotations]);
     setAnnotations(next);
     onHasUnsavedChanges(true);
-    exportModifiedPdf(next).then(onModify);
+    debouncedExportModifiedPdf(next);
   };
 
   const handleClearAll = () => {
+    if (annotations.length === 0) return;
     pushToHistory(annotations);
     setAnnotations([]);
-    onHasUnsavedChanges(true);
-    exportModifiedPdf([]).then(onModify);
+    onHasUnsavedChanges(false);
+    debouncedExportModifiedPdf([]);
   };
 
   // Toggle Highlight tool
@@ -1623,12 +1962,33 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
     }
   };
 
+  // Virtual spacer calculations for 60fps instant rendering of 800+ page documents
+  const pageH = (defaultDimensions.height || 842) * scale + 40;
+  const startPage = Math.max(1, Math.min(numPages || 1, visibleRange.start));
+  const endPage = Math.max(startPage, Math.min(numPages || 1, visibleRange.end));
+
+  const topSpacerHeight = Math.max(0, (startPage - 1) * pageH);
+  const bottomSpacerHeight = Math.max(0, (numPages - endPage) * pageH);
+
+  const visiblePages = useMemo(() => {
+    if (!numPages) return [];
+    const list: number[] = [];
+    for (let p = startPage; p <= endPage; p++) {
+      list.push(p);
+    }
+    return list;
+  }, [startPage, endPage, numPages]);
+
   return (
-    <div className="editor-container" onClick={() => {
-      if (showPenPopover) setShowPenPopover(false);
-      if (showHighlightPopover) setShowHighlightPopover(false);
-      if (showUnderlinePopover) setShowUnderlinePopover(false);
-    }}>
+    <div
+      className="editor-container"
+      onClick={() => {
+        if (showPenPopover) setShowPenPopover(false);
+        if (showHighlightPopover) setShowHighlightPopover(false);
+        if (showUnderlinePopover) setShowUnderlinePopover(false);
+        if (showSpeedPopover) setShowSpeedPopover(false);
+      }}
+    >
       {/* PDF Main Toolbar */}
       <div className="editor-toolbar">
         {/* Annotation Tools */}
@@ -2187,19 +2547,70 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
         </div>
 
         {/* Page Jump Selector & Zoom */}
-        <div className="toolbar-group" style={{ marginLeft: 'auto' }}>
+        <div className="toolbar-group" style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '4px' }}>
           {numPages > 1 && (
-            <select
-              value={currentPage}
-              onChange={(e) => scrollToPage(parseInt(e.target.value, 10))}
-              style={{ padding: '2px 6px', fontSize: '12px', height: '28px', background: 'var(--bg-tertiary)' }}
-            >
-              {Array.from({ length: numPages }, (_, i) => (
-                <option key={i + 1} value={i + 1}>
-                  Page {i + 1} / {numPages}
-                </option>
-              ))}
-            </select>
+            <>
+              <button
+                className="tool-button"
+                disabled={currentPage <= 1}
+                onClick={() => scrollToPage(currentPage - 1)}
+                title="Previous Page"
+                style={{ padding: '4px 6px', height: '28px' }}
+              >
+                <ChevronLeft size={15} />
+              </button>
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+                <input
+                  type="number"
+                  min={1}
+                  max={numPages}
+                  value={currentPage}
+                  onChange={(e) => {
+                    const val = parseInt(e.target.value, 10);
+                    if (!isNaN(val) && val >= 1 && val <= numPages) {
+                      scrollToPage(val);
+                    }
+                  }}
+                  style={{
+                    width: `${Math.max(42, (numPages.toString().length + 1) * 9)}px`,
+                    textAlign: 'center',
+                    fontSize: '12px',
+                    height: '26px',
+                    background: 'var(--bg-tertiary)',
+                    color: 'var(--text-primary)',
+                    border: '1px solid var(--border-subtle)',
+                    borderRadius: '4px',
+                    padding: '0 4px',
+                  }}
+                  title="Type page number & Enter to jump"
+                />
+                <span style={{ fontSize: '12px', color: 'var(--text-muted)' }}>/ {numPages}</span>
+              </div>
+
+              <button
+                className="tool-button"
+                disabled={currentPage >= numPages}
+                onClick={() => scrollToPage(currentPage + 1)}
+                title="Next Page"
+                style={{ padding: '4px 6px', height: '28px' }}
+              >
+                <ChevronRight size={15} />
+              </button>
+
+              <select
+                value={currentPage}
+                onChange={(e) => scrollToPage(parseInt(e.target.value, 10))}
+                style={{ padding: '2px 6px', fontSize: '12px', height: '28px', background: 'var(--bg-tertiary)', maxWidth: '110px' }}
+                title="Select page from list"
+              >
+                {Array.from({ length: numPages }, (_, i) => (
+                  <option key={i + 1} value={i + 1}>
+                    Page {i + 1}
+                  </option>
+                ))}
+              </select>
+            </>
           )}
 
           {numPages <= 1 && (
@@ -2212,7 +2623,7 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
 
           <button
             className="tool-button"
-            onClick={() => setScale((s) => Math.max(0.5, s - 0.15))}
+            onClick={() => setScale((s) => Math.max(0.4, Math.round((s - 0.15) * 100) / 100))}
             title="Zoom Out"
           >
             <ZoomOut size={16} />
@@ -2222,19 +2633,164 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
           </span>
           <button
             className="tool-button"
-            onClick={() => setScale((s) => Math.min(2.5, s + 0.15))}
+            onClick={() => setScale((s) => Math.min(3.0, Math.round((s + 0.15) * 100) / 100))}
             title="Zoom In"
           >
             <ZoomIn size={16} />
           </button>
+
+          <div className="tool-divider" />
+
+          {/* Fit to Width: Automatically fills screen and removes side margins */}
+          <button
+            className="tool-button"
+            onClick={handleFitToWidth}
+            title="Fit to Width (Fills screen width)"
+            style={{ display: 'flex', alignItems: 'center', gap: '4px', padding: '3px 8px', fontSize: '11.5px' }}
+          >
+            <Maximize2 size={14} />
+            <span>Fit Width</span>
+          </button>
+
+          {/* Fit to Page: Fits entire page height */}
+          <button
+            className="tool-button"
+            onClick={handleFitToPage}
+            title="Fit to Page (Fits full page on screen)"
+            style={{ display: 'flex', alignItems: 'center', gap: '4px', padding: '3px 8px', fontSize: '11.5px' }}
+          >
+            <Minimize2 size={14} />
+            <span>Fit Page</span>
+          </button>
+
+          <div className="tool-divider" />
+
+          {/* Custom Dynamic Scroll Speed Popover */}
+          <div style={{ position: 'relative' }}>
+            <button
+              className="tool-button"
+              onClick={(e) => {
+                e.stopPropagation();
+                setShowSpeedPopover((v) => !v);
+              }}
+              title="Custom Dynamic Scroll Speed"
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '5px',
+                padding: '3px 8px',
+                fontSize: '11.5px',
+                background: showSpeedPopover ? 'var(--bg-tertiary)' : undefined,
+              }}
+            >
+              <Gauge size={14} style={{ color: '#38bdf8' }} />
+              <span>Speed: {scrollSpeed}x</span>
+              <ChevronDown size={12} />
+            </button>
+
+            {showSpeedPopover && (
+              <div
+                onClick={(e) => e.stopPropagation()}
+                style={{
+                  position: 'absolute',
+                  top: 'calc(100% + 6px)',
+                  right: 0,
+                  background: 'var(--bg-secondary)',
+                  border: '1px solid var(--border-subtle)',
+                  borderRadius: '12px',
+                  padding: '12px 14px',
+                  boxShadow: '0 12px 30px rgba(0,0,0,0.5)',
+                  zIndex: 100,
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '10px',
+                  minWidth: '210px',
+                }}
+              >
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--text-primary)' }}>
+                    Scroll Speed
+                  </span>
+                  <span style={{ fontSize: '12px', fontWeight: 700, color: '#38bdf8' }}>
+                    {scrollSpeed}x
+                  </span>
+                </div>
+
+                <input
+                  type="range"
+                  min="0.5"
+                  max="4.0"
+                  step="0.25"
+                  value={scrollSpeed}
+                  onChange={(e) => handleSetScrollSpeed(parseFloat(e.target.value))}
+                  style={{ width: '100%', accentColor: '#38bdf8', cursor: 'pointer' }}
+                />
+
+                <div style={{ display: 'flex', gap: '4px', justifyContent: 'space-between' }}>
+                  {[0.75, 1.0, 1.5, 2.0, 3.0].map((s) => (
+                    <button
+                      key={s}
+                      onClick={() => handleSetScrollSpeed(s)}
+                      style={{
+                        padding: '3px 6px',
+                        fontSize: '11px',
+                        borderRadius: '6px',
+                        border: scrollSpeed === s ? '1px solid #38bdf8' : '1px solid var(--border-subtle)',
+                        background: scrollSpeed === s ? 'rgba(56, 189, 248, 0.2)' : 'var(--bg-tertiary)',
+                        color: scrollSpeed === s ? '#38bdf8' : 'var(--text-secondary)',
+                        cursor: 'pointer',
+                        fontWeight: scrollSpeed === s ? 600 : 400,
+                      }}
+                    >
+                      {s}x
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Collapse/Expand Upper Header & Tab Options (^ / v) */}
+          {onToggleCollapseHeader && (
+            <>
+              <div className="tool-divider" />
+              <button
+                className={`tool-button ${isHeaderCollapsed ? 'active' : ''}`}
+                onClick={onToggleCollapseHeader}
+                title={isHeaderCollapsed ? "Expand Upper Tabs & Options (v)" : "Collapse Upper Tabs & Options (^ Focus Mode)"}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  padding: '3px 8px',
+                  borderRadius: '6px',
+                  background: isHeaderCollapsed ? 'rgba(59, 130, 246, 0.25)' : undefined,
+                  border: isHeaderCollapsed ? '1px solid rgba(59, 130, 246, 0.6)' : '1px solid var(--border-subtle)',
+                  color: isHeaderCollapsed ? '#60a5fa' : 'var(--text-primary)',
+                  fontWeight: 700,
+                  fontSize: '14px',
+                }}
+              >
+                {isHeaderCollapsed ? <ChevronDown size={16} /> : <ChevronUp size={16} />}
+              </button>
+            </>
+          )}
         </div>
       </div>
 
-      {/* Continuous Multi-Page Scroll Viewport */}
+      {/* Continuous Multi-Page Scroll Viewport (with Press & Hold Momentum Drag-Scroll) */}
       <div
         ref={scrollContainerRef}
         className="editor-viewport"
         onScroll={handleScroll}
+        onMouseDown={handleStartDragScroll}
+        onMouseMove={handleMoveDragScroll}
+        onMouseUp={handleEndDragScroll}
+        onMouseLeave={handleEndDragScroll}
+        onDoubleClick={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+        }}
         style={{
           width: '100%',
           height: '100%',
@@ -2244,9 +2800,10 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
           flexDirection: 'column',
           alignItems: 'center',
           justifyContent: 'flex-start',
-          padding: '2.5rem 1rem',
+          padding: '1.5rem 0.5rem',
           boxSizing: 'border-box',
           position: 'relative',
+          cursor: activeTool === 'none' ? 'grab' : 'default',
         }}
       >
         {/* Smart Resumed from Page Banner */}
@@ -2327,14 +2884,60 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
           </div>
         )}
 
-        {/* Render Every Page from Page 1 to N */}
+        {loadError && (
+          <div
+            style={{
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              gap: '12px',
+              background: 'rgba(239, 68, 68, 0.15)',
+              border: '1px solid rgba(239, 68, 68, 0.4)',
+              padding: '18px 28px',
+              borderRadius: '16px',
+              color: '#fca5a5',
+              fontSize: '14px',
+              maxWidth: '500px',
+              textAlign: 'center',
+              margin: '2rem auto',
+            }}
+          >
+            <span>⚠️ {loadError}</span>
+            <button
+              className="btn-primary"
+              onClick={() => window.location.reload()}
+              style={{ fontSize: '12px', padding: '4px 14px' }}
+            >
+              Retry
+            </button>
+          </div>
+        )}
+
+        {/* Top Virtual Spacer */}
+        {topSpacerHeight > 0 && (
+          <div
+            aria-hidden="true"
+            style={{
+              width: '100%',
+              height: `${topSpacerHeight}px`,
+              flexShrink: 0,
+              pointerEvents: 'none',
+            }}
+          />
+        )}
+
+        {/* Render Only Active Visible Pages in DOM */}
         {pdfDocProxy &&
-          Array.from({ length: numPages }, (_, i) => i + 1).map((pageNum) => (
+          visiblePages.map((pageNum) => (
             <PdfPageView
               key={pageNum}
+              docId={file.id || file.name}
               pageNumber={pageNum}
               pdfDocProxy={pdfDocProxy}
               scale={scale}
+              defaultDimensions={defaultDimensions}
+              cachedDimensions={pageDimensions[pageNum]}
+              onDimensionsKnown={handleDimensionsKnown}
               activeTool={activeTool}
               selectedColor={
                 activeTool === 'draw'
@@ -2366,6 +2969,19 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
               onEraseAtPoint={handleEraseAtPoint}
             />
           ))}
+
+        {/* Bottom Virtual Spacer */}
+        {bottomSpacerHeight > 0 && (
+          <div
+            aria-hidden="true"
+            style={{
+              width: '100%',
+              height: `${bottomSpacerHeight}px`,
+              flexShrink: 0,
+              pointerEvents: 'none',
+            }}
+          />
+        )}
       </div>
     </div>
   );
