@@ -252,7 +252,7 @@ const PdfPageView: React.FC<PageViewProps> = ({
         const canvas = canvasRef.current;
         if (!canvas || isCancelled) return;
 
-        const ctx = canvas.getContext('2d', { alpha: false });
+        const ctx = canvas.getContext('2d', { alpha: true });
         if (!ctx) return;
 
         // 1. Check in-memory RAM bitmap cache (0ms instant response)
@@ -275,20 +275,22 @@ const PdfPageView: React.FC<PageViewProps> = ({
         const page = await pdfRamCache.getPage(pdfDocProxy, docId, pageNumber);
         if (isCancelled) return;
 
-        // Support High DPI displays for crisp rendering
+        // Support High DPI displays for crisp rendering while respecting GPU canvas limits
         const dpr = Math.min(window.devicePixelRatio || 1, 1.75);
-        const pixelViewport = page.getViewport({ scale: scale * dpr });
-        const cssViewport = page.getViewport({ scale });
         const unscaledViewport = page.getViewport({ scale: 1.0 });
+        const cssViewport = page.getViewport({ scale });
+
+        const MAX_CANVAS_DIM = 4096;
+        let renderScale = scale * dpr;
+        if (unscaledViewport.width * renderScale > MAX_CANVAS_DIM || unscaledViewport.height * renderScale > MAX_CANVAS_DIM) {
+          renderScale = Math.min(MAX_CANVAS_DIM / unscaledViewport.width, MAX_CANVAS_DIM / unscaledViewport.height);
+        }
+        const pixelViewport = page.getViewport({ scale: renderScale });
 
         canvas.width = pixelViewport.width;
         canvas.height = pixelViewport.height;
         canvas.style.width = `${cssViewport.width}px`;
         canvas.style.height = `${cssViewport.height}px`;
-
-        // Fill solid white background so transparent and black text PDF pages render with 100% clarity
-        ctx.fillStyle = '#ffffff';
-        ctx.fillRect(0, 0, pixelViewport.width, pixelViewport.height);
 
         setDimensions({ width: cssViewport.width, height: cssViewport.height });
         if (onDimensionsKnown) {
@@ -299,11 +301,29 @@ const PdfPageView: React.FC<PageViewProps> = ({
           canvasContext: ctx,
           viewport: pixelViewport,
           intent: 'display',
-          background: 'rgb(255, 255, 255)',
         };
 
         if ((pdfjsLib as any).AnnotationMode) {
           renderContext.annotationMode = (pdfjsLib as any).AnnotationMode.ENABLE;
+        }
+
+        if (typeof (pdfDocProxy as any).getOptionalContentConfig === 'function') {
+          renderContext.optionalContentConfigPromise = (pdfDocProxy as any)
+            .getOptionalContentConfig()
+            .then((ocConfig: any) => {
+              if (ocConfig && typeof ocConfig.getOrder === 'function') {
+                const order = ocConfig.getOrder();
+                if (Array.isArray(order)) {
+                  for (const id of order) {
+                    if (typeof id === 'string') {
+                      ocConfig.setVisibility(id, true, false);
+                    }
+                  }
+                }
+              }
+              return ocConfig;
+            })
+            .catch(() => null);
         }
 
         const task = page.render(renderContext);
@@ -1482,6 +1502,7 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
 
         const loadingTask = pdfjsLib.getDocument({
           data: rawData,
+          wasmUrl: '/pdfjs/wasm/',
           cMapUrl: '/pdfjs/cmaps/',
           cMapPacked: true,
           standardFontDataUrl: '/pdfjs/standard_fonts/',
@@ -1489,8 +1510,10 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
           disableAutoFetch: true,
           disableStream: true,
           disableRange: true,
-          verbosity: 0,
-        });
+          enableXfa: true,
+          useWasm: true,
+          verbosity: 1,
+        } as any);
 
         const pdf = await loadingTask.promise;
         if (!isCancelled) {

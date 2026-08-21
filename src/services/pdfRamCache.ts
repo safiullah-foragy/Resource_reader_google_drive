@@ -179,18 +179,33 @@ class PdfUltraRamCacheService {
       const cssViewport = page.getViewport({ scale });
 
       canvas = this.acquireCanvas(pixelViewport.width, pixelViewport.height);
-      const ctx = canvas.getContext('2d', { alpha: false });
+      const ctx = canvas.getContext('2d', { alpha: true });
       if (!ctx) return;
-
-      ctx.fillStyle = '#ffffff';
-      ctx.fillRect(0, 0, pixelViewport.width, pixelViewport.height);
 
       const renderContext: any = {
         canvasContext: ctx,
         viewport: pixelViewport,
         intent: 'display',
-        background: 'rgb(255, 255, 255)',
       };
+
+      if (typeof (pdfDocProxy as any).getOptionalContentConfig === 'function') {
+        renderContext.optionalContentConfigPromise = (pdfDocProxy as any)
+          .getOptionalContentConfig()
+          .then((ocConfig: any) => {
+            if (ocConfig && typeof ocConfig.getOrder === 'function') {
+              const order = ocConfig.getOrder();
+              if (Array.isArray(order)) {
+                for (const id of order) {
+                  if (typeof id === 'string') {
+                    ocConfig.setVisibility(id, true, false);
+                  }
+                }
+              }
+            }
+            return ocConfig;
+          })
+          .catch(() => null);
+      }
 
       const task = page.render(renderContext);
       await task.promise;
