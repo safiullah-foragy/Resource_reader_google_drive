@@ -118,7 +118,7 @@ export const Header: React.FC<HeaderProps> = ({
               className="btn-primary"
               onClick={onSaveToDrive}
               disabled={saveStatus === 'saving'}
-              title="Commit binary updates directly to Google Drive"
+              title="Save to Google Drive / Disk (Ctrl+S)"
             >
               {saveStatus === 'saving' ? (
                 <Loader2 size={16} className="animate-spin" />

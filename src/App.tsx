@@ -921,6 +921,22 @@ export function App() {
     }
   };
 
+  // Global Keyboard Shortcut: Ctrl+S / Cmd+S to Save to Drive / Disk
+  useEffect(() => {
+    const handleGlobalSaveShortcut = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+        e.preventDefault();
+        e.stopPropagation();
+        if (activeDocument && activeDocument.saveStatus !== 'saving') {
+          handleSaveToDrive();
+        }
+      }
+    };
+
+    window.addEventListener('keydown', handleGlobalSaveShortcut, true);
+    return () => window.removeEventListener('keydown', handleGlobalSaveShortcut, true);
+  }, [activeDocument, handleSaveToDrive]);
+
   // Save as Copy
   const handleSaveAsCopy = async () => {
     if (!activeDocument) return;
