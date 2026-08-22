@@ -256,6 +256,31 @@ const PdfPageView: React.FC<PageViewProps> = ({
   const shapeStartPointRef = useRef<Point | null>(null);
   const renderTaskRef = useRef<any>(null);
 
+  // Dynamic vertical-bar '|' cursor matching the exact highlighter width and selected color
+  const highlightCursor = useMemo(() => {
+    if (activeTool !== 'highlight') return null;
+    const markHeight = Math.round(strokeWidth * 4.5 * scale);
+    const svgHeight = Math.max(14, Math.min(128, markHeight));
+    const svgWidth = 22;
+    const cx = 11;
+    const cy = Math.round(svgHeight / 2);
+
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${svgWidth}" height="${svgHeight}" viewBox="0 0 ${svgWidth} ${svgHeight}">
+      <!-- Outer contrast border for crisp visibility over any background -->
+      <line x1="${cx}" y1="2" x2="${cx}" y2="${svgHeight - 2}" stroke="#0f172a" stroke-width="4.5" stroke-linecap="round"/>
+      <!-- Inner vertical bar '|' in highlight color -->
+      <line x1="${cx}" y1="2" x2="${cx}" y2="${svgHeight - 2}" stroke="${selectedColor || '#facc15'}" stroke-width="2.5" stroke-linecap="round"/>
+      <!-- Top guide tick showing upper boundary of highlight -->
+      <line x1="${cx - 5}" y1="2" x2="${cx + 5}" y2="2" stroke="#0f172a" stroke-width="3" stroke-linecap="round"/>
+      <line x1="${cx - 5}" y1="2" x2="${cx + 5}" y2="2" stroke="${selectedColor || '#facc15'}" stroke-width="1.8" stroke-linecap="round"/>
+      <!-- Bottom guide tick showing lower boundary of highlight -->
+      <line x1="${cx - 5}" y1="${svgHeight - 2}" x2="${cx + 5}" y2="${svgHeight - 2}" stroke="#0f172a" stroke-width="3" stroke-linecap="round"/>
+      <line x1="${cx - 5}" y1="${svgHeight - 2}" x2="${cx + 5}" y2="${svgHeight - 2}" stroke="${selectedColor || '#facc15'}" stroke-width="1.8" stroke-linecap="round"/>
+    </svg>`;
+
+    return `url("data:image/svg+xml;utf8,${encodeURIComponent(svg)}") ${cx} ${cy}, text`;
+  }, [activeTool, strokeWidth, scale, selectedColor]);
+
   // Render PDF page canvas (with 0ms RAM Bitmap Cache)
   useEffect(() => {
     if (!pdfDocProxy || !canvasRef.current) return;
@@ -613,6 +638,47 @@ const PdfPageView: React.FC<PageViewProps> = ({
     setIsDrawing(true);
     shapeStartPointRef.current = pt;
     currentPathRef.current = [pt];
+
+    if (activeTool === 'highlight') {
+      redrawOverlay();
+      const highlightCanvas = highlightCanvasRef.current;
+      if (highlightCanvas) {
+        const hlCtx = highlightCanvas.getContext('2d');
+        if (hlCtx) {
+          hlCtx.save();
+          hlCtx.globalAlpha = highlightOpacity;
+          hlCtx.strokeStyle = selectedColor;
+          hlCtx.lineWidth = strokeWidth * 4.5 * scale;
+          hlCtx.lineCap = highlightMode === 'variable' ? 'round' : 'square';
+          hlCtx.lineJoin = highlightMode === 'variable' ? 'round' : 'miter';
+          hlCtx.beginPath();
+          hlCtx.moveTo(pt.x * scale, pt.y * scale);
+          hlCtx.lineTo(pt.x * scale + 0.1, pt.y * scale);
+          hlCtx.stroke();
+          hlCtx.restore();
+        }
+      }
+
+      // Initial visual start vertical bar '|' indicator at placement point
+      if (highlightMode === 'fixed') {
+        const overlay = overlayCanvasRef.current;
+        if (overlay) {
+          const ctx = overlay.getContext('2d');
+          if (ctx) {
+            const markThickness = strokeWidth * 4.5 * scale;
+            const halfH = markThickness / 2;
+            ctx.save();
+            ctx.strokeStyle = selectedColor || '#0284c7';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(pt.x * scale, pt.y * scale - halfH);
+            ctx.lineTo(pt.x * scale, pt.y * scale + halfH);
+            ctx.stroke();
+            ctx.restore();
+          }
+        }
+      }
+    }
   };
 
   const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -677,7 +743,7 @@ const PdfPageView: React.FC<PageViewProps> = ({
           hlCtx.restore();
         }
       } else {
-        // Fixed Mode: Smart straight-line uniform highlighter flow from initial click to straight end
+        // Fixed Mode: Smart straight-line uniform highlighter flow from initial click following the covered area
         redrawOverlay();
         const highlightCanvas = highlightCanvasRef.current;
         if (!highlightCanvas || !shapeStartPointRef.current) return;
@@ -687,11 +753,12 @@ const PdfPageView: React.FC<PageViewProps> = ({
         const start = shapeStartPointRef.current;
         const straightEndX = pt.x;
         const straightEndY = start.y;
+        const markThickness = strokeWidth * 4.5 * scale;
 
         hlCtx.save();
         hlCtx.globalAlpha = highlightOpacity;
         hlCtx.strokeStyle = selectedColor;
-        hlCtx.lineWidth = strokeWidth * 4.5 * scale;
+        hlCtx.lineWidth = markThickness;
         hlCtx.lineCap = 'square';
         hlCtx.lineJoin = 'miter';
 
@@ -700,6 +767,36 @@ const PdfPageView: React.FC<PageViewProps> = ({
         hlCtx.lineTo(straightEndX * scale, straightEndY * scale);
         hlCtx.stroke();
         hlCtx.restore();
+
+        // Draw dynamic '|' signs at initial start point and current cursor point tracking covered area
+        const overlay = overlayCanvasRef.current;
+        if (overlay) {
+          const ctx = overlay.getContext('2d');
+          if (ctx) {
+            const halfH = markThickness / 2;
+            const startX = start.x * scale;
+            const startY = start.y * scale;
+            const curX = straightEndX * scale;
+
+            ctx.save();
+            ctx.strokeStyle = selectedColor || '#0284c7';
+            ctx.lineWidth = 2;
+
+            // Initial start vertical bar '|'
+            ctx.beginPath();
+            ctx.moveTo(startX, startY - halfH);
+            ctx.lineTo(startX, startY + halfH);
+            ctx.stroke();
+
+            // End / current vertical bar '|' following the covered area
+            ctx.beginPath();
+            ctx.moveTo(curX, startY - halfH);
+            ctx.lineTo(curX, startY + halfH);
+            ctx.stroke();
+
+            ctx.restore();
+          }
+        }
       }
     } else if (['underline', 'rect', 'circle', 'arrow'].includes(activeTool)) {
       redrawOverlay();
@@ -762,19 +859,31 @@ const PdfPageView: React.FC<PageViewProps> = ({
       newAnnotation.points = [...currentPathRef.current];
     } else if (activeTool === 'highlight') {
       if (highlightMode === 'variable') {
-        if (currentPathRef.current.length < 2) return;
+        if (currentPathRef.current.length < 2) {
+          redrawOverlay();
+          return;
+        }
         newAnnotation.points = [...currentPathRef.current];
         newAnnotation.strokeWidth = strokeWidth;
         newAnnotation.opacity = highlightOpacity;
       } else {
-        if (!shapeStartPointRef.current) return;
+        if (!shapeStartPointRef.current) {
+          redrawOverlay();
+          return;
+        }
         const start = shapeStartPointRef.current;
         const straightEndX = pt.x;
         const straightEndY = start.y;
-        if (Math.abs(straightEndX - start.x) < 2) return;
+        if (Math.abs(straightEndX - start.x) < 2) {
+          redrawOverlay();
+          return;
+        }
 
-        newAnnotation.startPoint = { x: start.x, y: start.y };
-        newAnnotation.endPoint = { x: straightEndX, y: straightEndY };
+        const minX = Math.min(start.x, straightEndX);
+        const maxX = Math.max(start.x, straightEndX);
+
+        newAnnotation.startPoint = { x: minX, y: start.y };
+        newAnnotation.endPoint = { x: maxX, y: straightEndY };
         newAnnotation.strokeWidth = strokeWidth;
         newAnnotation.opacity = highlightOpacity;
       }
@@ -1052,7 +1161,7 @@ const PdfPageView: React.FC<PageViewProps> = ({
                 : activeTool === 'draw'
                 ? 'crosshair'
                 : activeTool === 'highlight'
-                ? 'crosshair'
+                ? highlightCursor || 'text'
                 : 'default',
           }}
           onMouseDown={handleMouseDown}
