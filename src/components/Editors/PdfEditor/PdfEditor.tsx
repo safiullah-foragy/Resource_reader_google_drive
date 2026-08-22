@@ -1,11 +1,11 @@
-import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo, useLayoutEffect } from 'react';
 import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
 import * as pdfjsLib from 'pdfjs-dist';
 import pdfjsWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { 
   Pen, 
   Highlighter, 
-  Underline as UnderlineIcon,
+  Underline as UnderlineIcon, 
   Type, 
   StickyNote, 
   Square, 
@@ -213,6 +213,14 @@ const PdfPageView: React.FC<PageViewProps> = ({
     width: initialDim.width * scale,
     height: initialDim.height * scale,
   });
+
+  useEffect(() => {
+    const dim = cachedDimensions || defaultDimensions;
+    setDimensions({
+      width: dim.width * scale,
+      height: dim.height * scale,
+    });
+  }, [scale, cachedDimensions, defaultDimensions]);
   const [isRendered, setIsRendered] = useState<boolean>(false);
   const [isDrawing, setIsDrawing] = useState<boolean>(false);
 
@@ -1600,17 +1608,189 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
     };
   }, [currentPage, scale, pdfDocProxy, numPages, file.id, file.name]);
 
+  const isZoomingRef = useRef<boolean>(false);
+  const pendingScrollAnchorRef = useRef<{
+    page: number;
+    ratio: number;
+  } | null>(null);
+
+  // Accurate single-page height including header badge and bottom margin
+  const getSinglePageHeight = useCallback(
+    (p: number, currentScale: number) => {
+      const h = pageDimensions[p]?.height || defaultDimensions.height || 841.89;
+      return h * currentScale + 72;
+    },
+    [pageDimensions, defaultDimensions.height]
+  );
+
+  // Cumulative vertical offset from top of document to top of target page
+  const getCumulativeTop = useCallback(
+    (targetPage: number, currentScale: number) => {
+      let top = 0;
+      for (let p = 1; p < targetPage; p++) {
+        top += getSinglePageHeight(p, currentScale);
+      }
+      return top;
+    },
+    [getSinglePageHeight]
+  );
+
+  // Determine active page at a given vertical scroll offset
+  const findPageAtScrollTop = useCallback(
+    (scrollTopOffset: number, currentScale: number) => {
+      let accumulated = 0;
+      for (let p = 1; p <= numPages; p++) {
+        const h = getSinglePageHeight(p, currentScale);
+        if (scrollTopOffset < accumulated + h) {
+          return p;
+        }
+        accumulated += h;
+      }
+      return Math.max(1, numPages);
+    },
+    [numPages, getSinglePageHeight]
+  );
+
+  // Virtual spacer calculations for 60fps instant rendering of 800+ page documents
+  const startPage = Math.max(1, Math.min(numPages || 1, visibleRange.start));
+  const endPage = Math.max(startPage, Math.min(numPages || 1, visibleRange.end));
+
+  const topSpacerHeight = useMemo(() => {
+    if (startPage <= 1) return 0;
+    return getCumulativeTop(startPage, scale);
+  }, [startPage, scale, getCumulativeTop]);
+
+  const bottomSpacerHeight = useMemo(() => {
+    if (endPage >= numPages) return 0;
+    let height = 0;
+    for (let p = endPage + 1; p <= numPages; p++) {
+      height += getSinglePageHeight(p, scale);
+    }
+    return height;
+  }, [endPage, numPages, scale, getSinglePageHeight]);
+
+  const visiblePages = useMemo(() => {
+    if (!numPages) return [];
+    const list: number[] = [];
+    for (let p = startPage; p <= endPage; p++) {
+      list.push(p);
+    }
+    return list;
+  }, [startPage, endPage, numPages]);
+
+  // Steady Zoom Handler: Preserves exact reading page & paragraph position during Zoom In / Zoom Out
+  const changeScale = useCallback(
+    (newScaleOrUpdater: number | ((prev: number) => number)) => {
+      const container = scrollContainerRef.current;
+      const nextScale =
+        typeof newScaleOrUpdater === 'function'
+          ? (newScaleOrUpdater as (prev: number) => number)(scale)
+          : newScaleOrUpdater;
+      const clampedScale = Math.max(0.4, Math.min(3.0, Math.round(nextScale * 100) / 100));
+
+      if (clampedScale === scale) return;
+
+      let anchorPage = currentPage;
+      let ratio = 0;
+
+      if (container) {
+        const containerRect = container.getBoundingClientRect();
+        const containerTop = containerRect.top;
+
+        // Find which page is currently in view near the top of the viewport
+        let found = false;
+        const pagesToCheck = visiblePages.length > 0 ? visiblePages : [currentPage];
+        for (const p of pagesToCheck) {
+          const el = document.getElementById(`pdf-page-${p}`);
+          if (el) {
+            const r = el.getBoundingClientRect();
+            if (r.bottom > containerTop + 10 && r.top <= containerTop + containerRect.height * 0.65) {
+              anchorPage = p;
+              const pageH = r.height || 1;
+              const offset = Math.max(0, containerTop - r.top);
+              ratio = offset / pageH;
+              found = true;
+              break;
+            }
+          }
+        }
+
+        if (!found) {
+          anchorPage = currentPage;
+          const currentTop = getCumulativeTop(anchorPage, scale);
+          const pageH = getSinglePageHeight(anchorPage, scale);
+          ratio = Math.max(0, Math.min(1, (container.scrollTop - currentTop) / Math.max(1, pageH)));
+        }
+      }
+
+      pendingScrollAnchorRef.current = { page: anchorPage, ratio };
+      isZoomingRef.current = true;
+
+      // Update visible range around anchor page immediately so it renders in DOM
+      setVisibleRange({
+        start: Math.max(1, anchorPage - 2),
+        end: Math.min(numPages, anchorPage + 3),
+      });
+
+      setScale(clampedScale);
+    },
+    [scale, currentPage, visiblePages, getCumulativeTop, getSinglePageHeight, numPages]
+  );
+
+  // Synchronously lock scroll position to same page and exact relative position upon scale change
+  useLayoutEffect(() => {
+    if (!pendingScrollAnchorRef.current || !scrollContainerRef.current) return;
+    const { page, ratio } = pendingScrollAnchorRef.current;
+    pendingScrollAnchorRef.current = null;
+
+    const newPageTop = getCumulativeTop(page, scale);
+    const newPageH = getSinglePageHeight(page, scale);
+    const targetScrollTop = Math.max(0, newPageTop + ratio * newPageH);
+
+    scrollContainerRef.current.scrollTop = targetScrollTop;
+
+    // Settle browser layout and release zooming lock
+    requestAnimationFrame(() => {
+      if (scrollContainerRef.current) {
+        scrollContainerRef.current.scrollTop = targetScrollTop;
+      }
+      setTimeout(() => {
+        isZoomingRef.current = false;
+      }, 50);
+    });
+  }, [scale, getCumulativeTop, getSinglePageHeight]);
+
+  // Support smooth Ctrl + Mouse Wheel / trackpad pinch zooming without page jumping
+  useEffect(() => {
+    const container = scrollContainerRef.current;
+    if (!container) return;
+
+    const handleWheel = (e: WheelEvent) => {
+      if (e.ctrlKey || e.metaKey) {
+        e.preventDefault();
+        const zoomStep = e.deltaY < 0 ? 0.15 : -0.15;
+        changeScale((s) => Math.max(0.4, Math.min(3.0, Math.round((s + zoomStep) * 100) / 100)));
+      }
+    };
+
+    container.addEventListener('wheel', handleWheel, { passive: false });
+    return () => {
+      container.removeEventListener('wheel', handleWheel);
+    };
+  }, [changeScale]);
+
   // Track active page and update visible rendering window smoothly
   const handleScroll = useCallback(() => {
     if (!scrollContainerRef.current || numPages === 0) return;
+    if (isZoomingRef.current) return;
+
     const container = scrollContainerRef.current;
     const scrollTop = container.scrollTop;
     const clientHeight = container.clientHeight || 800;
 
-    const defaultPageH = (defaultDimensions.height || 842) * scale + 40;
-    const startPage = Math.max(1, Math.floor((scrollTop - defaultPageH * 1.5) / defaultPageH) + 1);
-    const endPage = Math.min(numPages, Math.ceil((scrollTop + clientHeight + defaultPageH * 1.5) / defaultPageH) + 1);
-    const centerPage = Math.min(numPages, Math.max(1, Math.floor((scrollTop + clientHeight / 3) / defaultPageH) + 1));
+    const startPage = Math.max(1, findPageAtScrollTop(Math.max(0, scrollTop - clientHeight), scale) - 1);
+    const endPage = Math.min(numPages, findPageAtScrollTop(scrollTop + clientHeight * 2, scale) + 1);
+    const centerPage = Math.min(numPages, Math.max(1, findPageAtScrollTop(scrollTop + clientHeight / 3, scale)));
 
     setVisibleRange((prev) => {
       if (prev.start === startPage && prev.end === endPage) return prev;
@@ -1622,7 +1802,7 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
       const storageKey = `pdf_last_read_page_${file.id || file.name}`;
       localStorage.setItem(storageKey, centerPage.toString());
     }
-  }, [numPages, defaultDimensions.height, scale, file.id, file.name, currentPage]);
+  }, [numPages, scale, file.id, file.name, currentPage, findPageAtScrollTop]);
 
   // Jump to specific page
   const scrollToPage = useCallback((pageNum: number) => {
@@ -1635,41 +1815,32 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
     const storageKey = `pdf_last_read_page_${file.id || file.name}`;
     localStorage.setItem(storageKey, targetPage.toString());
 
-    const defaultPageH = (defaultDimensions.height || 842) * scale + 40;
-    const el = document.getElementById(`pdf-page-${targetPage}`);
-    if (el) {
-      el.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    } else if (scrollContainerRef.current) {
+    const targetTop = getCumulativeTop(targetPage, scale);
+    if (scrollContainerRef.current) {
       scrollContainerRef.current.scrollTo({
-        top: (targetPage - 1) * defaultPageH,
+        top: targetTop,
         behavior: 'smooth',
       });
-      setTimeout(() => {
-        const renderedEl = document.getElementById(`pdf-page-${targetPage}`);
-        if (renderedEl) {
-          renderedEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
-        }
-      }, 50);
     }
-  }, [numPages, file.id, file.name, defaultDimensions.height, scale]);
+  }, [numPages, file.id, file.name, scale, getCumulativeTop]);
 
   // Auto Fit to Screen Width (minimizes wasted side margin/empty space)
   const handleFitToWidth = useCallback(() => {
     if (!scrollContainerRef.current) return;
     const containerWidth = scrollContainerRef.current.clientWidth || 900;
-    const pageWidth = defaultDimensions.width || 595.28;
-    const targetScale = Math.max(0.4, Math.min(3.0, (containerWidth - 32) / pageWidth));
-    setScale(Math.round(targetScale * 100) / 100);
-  }, [defaultDimensions.width]);
+    const pageWidth = pageDimensions[currentPage]?.width || defaultDimensions.width || 595.28;
+    const targetScale = Math.max(0.4, Math.min(3.0, (containerWidth - 48) / pageWidth));
+    changeScale(Math.round(targetScale * 100) / 100);
+  }, [defaultDimensions.width, pageDimensions, currentPage, changeScale]);
 
   // Fit Entire Page into Viewport Height
   const handleFitToPage = useCallback(() => {
     if (!scrollContainerRef.current) return;
     const containerHeight = scrollContainerRef.current.clientHeight || 800;
-    const pageHeight = (defaultDimensions.height || 841.89) + 40;
-    const targetScale = Math.max(0.4, Math.min(3.0, (containerHeight - 32) / pageHeight));
-    setScale(Math.round(targetScale * 100) / 100);
-  }, [defaultDimensions.height]);
+    const pageHeight = (pageDimensions[currentPage]?.height || defaultDimensions.height || 841.89) + 72;
+    const targetScale = Math.max(0.4, Math.min(3.0, (containerHeight - 48) / pageHeight));
+    changeScale(Math.round(targetScale * 100) / 100);
+  }, [defaultDimensions.height, pageDimensions, currentPage, changeScale]);
 
   // Single-Click Press & Hold Drag-to-Scroll with Kinetic Inertia
   const panDragRef = useRef<{
@@ -2105,23 +2276,6 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
       setSelectedColor(noteColor);
     }
   };
-
-  // Virtual spacer calculations for 60fps instant rendering of 800+ page documents
-  const pageH = (defaultDimensions.height || 842) * scale + 40;
-  const startPage = Math.max(1, Math.min(numPages || 1, visibleRange.start));
-  const endPage = Math.max(startPage, Math.min(numPages || 1, visibleRange.end));
-
-  const topSpacerHeight = Math.max(0, (startPage - 1) * pageH);
-  const bottomSpacerHeight = Math.max(0, (numPages - endPage) * pageH);
-
-  const visiblePages = useMemo(() => {
-    if (!numPages) return [];
-    const list: number[] = [];
-    for (let p = startPage; p <= endPage; p++) {
-      list.push(p);
-    }
-    return list;
-  }, [startPage, endPage, numPages]);
 
   return (
     <div
@@ -2767,7 +2921,7 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
 
           <button
             className="tool-button"
-            onClick={() => setScale((s) => Math.max(0.4, Math.round((s - 0.15) * 100) / 100))}
+            onClick={() => changeScale((s) => Math.max(0.4, Math.round((s - 0.15) * 100) / 100))}
             title="Zoom Out"
           >
             <ZoomOut size={16} />
@@ -2777,7 +2931,7 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
           </span>
           <button
             className="tool-button"
-            onClick={() => setScale((s) => Math.min(3.0, Math.round((s + 0.15) * 100) / 100))}
+            onClick={() => changeScale((s) => Math.min(3.0, Math.round((s + 0.15) * 100) / 100))}
             title="Zoom In"
           >
             <ZoomIn size={16} />
