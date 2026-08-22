@@ -309,6 +309,7 @@
 
 /* Sub-toolbar */
 .editor-toolbar {
+  position: relative;
   height: 48px;
   min-height: 48px;
   background: var(--bg-secondary);
@@ -318,13 +319,10 @@
   justify-content: space-between;
   padding: 0 1rem;
   gap: 0.5rem;
-  z-index: 30;
-  overflow-x: auto;
-  scrollbar-width: none;
+  z-index: 100;
+  overflow: visible;
 }
-.editor-toolbar::-webkit-scrollbar {
-  display: none;
-}
+
 
 .toolbar-group {
   display: flex;
