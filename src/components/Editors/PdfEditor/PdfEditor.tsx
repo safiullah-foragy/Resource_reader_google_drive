@@ -46,13 +46,23 @@ interface PdfEditorProps {
   onToggleCollapseHeader?: () => void;
 }
 
-// 5 Opacity / Strength Divisions for Highlighter
+// 15 Opacity / Strength Variations for Highlighter (MS Edge style translucent levels)
 const HIGHLIGHT_STRENGTHS = [
-  { label: '1 - Very Light', value: 0.15, height: '6px' },
-  { label: '2 - Light', value: 0.30, height: '10px' },
-  { label: '3 - Medium', value: 0.50, height: '15px' },
-  { label: '4 - Strong', value: 0.70, height: '22px' },
-  { label: '5 - Very Dark', value: 0.90, height: '30px' },
+  { level: 1, value: 0.06 },
+  { level: 2, value: 0.10 },
+  { level: 3, value: 0.15 },
+  { level: 4, value: 0.20 },
+  { level: 5, value: 0.25 },
+  { level: 6, value: 0.30 },
+  { level: 7, value: 0.36 },
+  { level: 8, value: 0.42 },
+  { level: 9, value: 0.48 },
+  { level: 10, value: 0.55 },
+  { level: 11, value: 0.63 },
+  { level: 12, value: 0.71 },
+  { level: 13, value: 0.79 },
+  { level: 14, value: 0.87 },
+  { level: 15, value: 0.95 },
 ];
 
 const HIGHLIGHT_COLORS = [
@@ -74,11 +84,12 @@ const HIGHLIGHT_WIDTHS = [
 ];
 
 const UNDERLINE_COLORS = [
-  { name: 'Red', hex: '#ef4444' },
-  { name: 'Blue', hex: '#3b82f6' },
-  { name: 'Green', hex: '#10b981' },
-  { name: 'Amber', hex: '#f59e0b' },
-  { name: 'Purple', hex: '#8b5cf6' },
+  { name: 'Red', hex: '#dc2626' },
+  { name: 'Blue', hex: '#1d4ed8' },
+  { name: 'Green', hex: '#15803d' },
+  { name: 'Amber', hex: '#d97706' },
+  { name: 'Purple', hex: '#7e22ce' },
+  { name: 'Pink', hex: '#be185d' },
   { name: 'Black', hex: '#000000' },
   { name: 'White', hex: '#ffffff' },
 ];
@@ -92,12 +103,12 @@ const UNDERLINE_WIDTHS = [
 ];
 
 const PEN_COLORS = [
-  { name: 'Red', hex: '#ef4444' },
-  { name: 'Blue', hex: '#3b82f6' },
-  { name: 'Green', hex: '#10b981' },
-  { name: 'Amber', hex: '#f59e0b' },
-  { name: 'Purple', hex: '#8b5cf6' },
-  { name: 'Pink', hex: '#ec4899' },
+  { name: 'Red', hex: '#dc2626' },
+  { name: 'Blue', hex: '#1d4ed8' },
+  { name: 'Green', hex: '#15803d' },
+  { name: 'Amber', hex: '#d97706' },
+  { name: 'Purple', hex: '#7e22ce' },
+  { name: 'Pink', hex: '#be185d' },
   { name: 'Black', hex: '#000000' },
   { name: 'White', hex: '#ffffff' },
 ];
@@ -207,6 +218,7 @@ const PdfPageView: React.FC<PageViewProps> = ({
   onEraseAtPoint,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const highlightCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const overlayCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const initialDim = cachedDimensions || defaultDimensions;
   const [dimensions, setDimensions] = useState<{ width: number; height: number }>({
@@ -379,52 +391,62 @@ const PdfPageView: React.FC<PageViewProps> = ({
   // Redraw annotations on overlay
   const redrawOverlay = useCallback(() => {
     const overlay = overlayCanvasRef.current;
-    if (!overlay) return;
+    const highlightCanvas = highlightCanvasRef.current;
+    if (!overlay || !highlightCanvas) return;
+
     const ctx = overlay.getContext('2d');
-    if (!ctx) return;
+    const hlCtx = highlightCanvas.getContext('2d');
+    if (!ctx || !hlCtx) return;
 
     overlay.width = dimensions.width;
     overlay.height = dimensions.height;
     ctx.clearRect(0, 0, overlay.width, overlay.height);
 
+    highlightCanvas.width = dimensions.width;
+    highlightCanvas.height = dimensions.height;
+    hlCtx.clearRect(0, 0, highlightCanvas.width, highlightCanvas.height);
+
     const pageAnnotations = annotations.filter((a) => a.pageIndex === pageNumber);
 
     pageAnnotations.forEach((item) => {
-      ctx.save();
-      ctx.strokeStyle = item.color;
-      ctx.fillStyle = item.color;
-      ctx.lineWidth = item.strokeWidth * scale;
-      ctx.lineCap = 'round';
-      ctx.lineJoin = 'round';
-
       if (item.type === 'highlight') {
-        // True transparent fluorescent highlight overlay using multiply
-        ctx.globalCompositeOperation = 'multiply';
-        ctx.globalAlpha = item.opacity !== undefined ? item.opacity : 0.30;
-        ctx.lineWidth = (item.strokeWidth || 3) * 4.5 * scale;
-        ctx.lineCap = 'square';
-        ctx.lineJoin = 'miter';
+        hlCtx.save();
+        hlCtx.strokeStyle = item.color;
+        hlCtx.fillStyle = item.color;
+        // With mix-blend-mode: multiply on the highlight layer, text stays 100% visible even 5+ times
+        hlCtx.globalAlpha = item.opacity !== undefined ? item.opacity : 0.95;
+        hlCtx.lineWidth = (item.strokeWidth || 3) * 4.5 * scale;
+        hlCtx.lineCap = item.points && item.points.length > 1 ? 'round' : 'square';
+        hlCtx.lineJoin = item.points && item.points.length > 1 ? 'round' : 'miter';
 
         if (item.startPoint && item.endPoint) {
-          ctx.beginPath();
-          ctx.moveTo(item.startPoint.x * scale, item.startPoint.y * scale);
-          ctx.lineTo(item.endPoint.x * scale, item.endPoint.y * scale);
-          ctx.stroke();
+          hlCtx.beginPath();
+          hlCtx.moveTo(item.startPoint.x * scale, item.startPoint.y * scale);
+          hlCtx.lineTo(item.endPoint.x * scale, item.endPoint.y * scale);
+          hlCtx.stroke();
         } else if (item.points && item.points.length > 1) {
-          ctx.beginPath();
-          ctx.moveTo(item.points[0].x * scale, item.points[0].y * scale);
+          hlCtx.beginPath();
+          hlCtx.moveTo(item.points[0].x * scale, item.points[0].y * scale);
           for (let i = 1; i < item.points.length; i++) {
-            ctx.lineTo(item.points[i].x * scale, item.points[i].y * scale);
+            hlCtx.lineTo(item.points[i].x * scale, item.points[i].y * scale);
           }
-          ctx.stroke();
+          hlCtx.stroke();
         }
+        hlCtx.restore();
       } else if (item.type === 'underline') {
+        ctx.save();
+        ctx.strokeStyle = item.color;
+        ctx.fillStyle = item.color;
         ctx.globalCompositeOperation = 'source-over';
-        ctx.globalAlpha = 0.95;
+        ctx.globalAlpha = 1.0;
         ctx.lineWidth = item.strokeWidth * scale;
         ctx.lineCap = 'round';
         ctx.lineJoin = 'round';
       } else {
+        ctx.save();
+        ctx.strokeStyle = item.color;
+        ctx.fillStyle = item.color;
+        ctx.lineWidth = item.strokeWidth * scale;
         ctx.globalCompositeOperation = 'source-over';
         ctx.globalAlpha = item.opacity || 1.0;
         ctx.lineCap = 'round';
@@ -629,55 +651,55 @@ const PdfPageView: React.FC<PageViewProps> = ({
       ctx.restore();
     } else if (activeTool === 'highlight') {
       if (highlightMode === 'variable') {
-        // Variable Mode: follows cursor freely so user can make random markings
+        // Variable Mode: smooth continuous polyline stroke in multiply layer
         currentPathRef.current.push(pt);
-        const overlay = overlayCanvasRef.current;
-        if (!overlay) return;
-        const ctx = overlay.getContext('2d');
-        if (!ctx) return;
-
-        ctx.save();
-        ctx.globalCompositeOperation = 'multiply';
-        ctx.globalAlpha = highlightOpacity;
-        ctx.strokeStyle = selectedColor;
-        ctx.lineWidth = strokeWidth * 4.5 * scale;
-        ctx.lineCap = 'round';
-        ctx.lineJoin = 'round';
+        redrawOverlay();
+        const highlightCanvas = highlightCanvasRef.current;
+        if (!highlightCanvas) return;
+        const hlCtx = highlightCanvas.getContext('2d');
+        if (!hlCtx) return;
 
         const pts = currentPathRef.current;
         if (pts.length > 1) {
-          const last = pts[pts.length - 2];
-          ctx.beginPath();
-          ctx.moveTo(last.x * scale, last.y * scale);
-          ctx.lineTo(pt.x * scale, pt.y * scale);
-          ctx.stroke();
+          hlCtx.save();
+          hlCtx.globalAlpha = highlightOpacity;
+          hlCtx.strokeStyle = selectedColor;
+          hlCtx.lineWidth = strokeWidth * 4.5 * scale;
+          hlCtx.lineCap = 'round';
+          hlCtx.lineJoin = 'round';
+
+          hlCtx.beginPath();
+          hlCtx.moveTo(pts[0].x * scale, pts[0].y * scale);
+          for (let i = 1; i < pts.length; i++) {
+            hlCtx.lineTo(pts[i].x * scale, pts[i].y * scale);
+          }
+          hlCtx.stroke();
+          hlCtx.restore();
         }
-        ctx.restore();
       } else {
         // Fixed Mode: Smart straight-line uniform highlighter flow from initial click to straight end
         redrawOverlay();
-        const overlay = overlayCanvasRef.current;
-        if (!overlay || !shapeStartPointRef.current) return;
-        const ctx = overlay.getContext('2d');
-        if (!ctx) return;
+        const highlightCanvas = highlightCanvasRef.current;
+        if (!highlightCanvas || !shapeStartPointRef.current) return;
+        const hlCtx = highlightCanvas.getContext('2d');
+        if (!hlCtx) return;
 
         const start = shapeStartPointRef.current;
         const straightEndX = pt.x;
         const straightEndY = start.y;
 
-        ctx.save();
-        ctx.globalCompositeOperation = 'multiply';
-        ctx.globalAlpha = highlightOpacity;
-        ctx.strokeStyle = selectedColor;
-        ctx.lineWidth = strokeWidth * 4.5 * scale;
-        ctx.lineCap = 'square';
-        ctx.lineJoin = 'miter';
+        hlCtx.save();
+        hlCtx.globalAlpha = highlightOpacity;
+        hlCtx.strokeStyle = selectedColor;
+        hlCtx.lineWidth = strokeWidth * 4.5 * scale;
+        hlCtx.lineCap = 'square';
+        hlCtx.lineJoin = 'miter';
 
-        ctx.beginPath();
-        ctx.moveTo(start.x * scale, start.y * scale);
-        ctx.lineTo(straightEndX * scale, straightEndY * scale);
-        ctx.stroke();
-        ctx.restore();
+        hlCtx.beginPath();
+        hlCtx.moveTo(start.x * scale, start.y * scale);
+        hlCtx.lineTo(straightEndX * scale, straightEndY * scale);
+        hlCtx.stroke();
+        hlCtx.restore();
       }
     } else if (['underline', 'rect', 'circle', 'arrow'].includes(activeTool)) {
       redrawOverlay();
@@ -999,6 +1021,21 @@ const PdfPageView: React.FC<PageViewProps> = ({
             height: `${dimensions.height}px`,
             backgroundColor: '#ffffff',
             borderRadius: '4px',
+          }}
+        />
+
+        {/* Highlight Layer Canvas (Multiply blend mode over base PDF page) */}
+        <canvas
+          ref={highlightCanvasRef}
+          style={{
+            position: 'absolute',
+            top: 0,
+            left: 0,
+            width: `${dimensions.width}px`,
+            height: `${dimensions.height}px`,
+            zIndex: 5,
+            pointerEvents: 'none',
+            mixBlendMode: 'multiply',
           }}
         />
 
@@ -1392,19 +1429,19 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
   };
 
   // Pen settings
-  const [penColor, setPenColor] = useState<string>('#ef4444');
+  const [penColor, setPenColor] = useState<string>('#dc2626');
   const [penWidth, setPenWidth] = useState<number>(3); // 1px to 12px
   const [showPenPopover, setShowPenPopover] = useState<boolean>(false);
 
-  // Highlight settings
+  // Highlight settings (Default is highest strength: Level 15 / 0.95)
   const [highlightColor, setHighlightColor] = useState<string>('#facc15');
-  const [highlightStrength, setHighlightStrength] = useState<number>(0.30); // 5 divisions (0.15 to 0.90)
+  const [highlightStrength, setHighlightStrength] = useState<number>(0.95); // Default Level 15 (0.95)
   const [highlightWidth, setHighlightWidth] = useState<number>(4.5); // 2 to 8.5
   const [highlightMode, setHighlightMode] = useState<'fixed' | 'variable'>('fixed'); // 'fixed' = straight line, 'variable' = freehand cursor follow
   const [showHighlightPopover, setShowHighlightPopover] = useState<boolean>(false);
 
   // Underline settings
-  const [underlineColor, setUnderlineColor] = useState<string>('#ef4444');
+  const [underlineColor, setUnderlineColor] = useState<string>('#dc2626');
   const [underlineWidth, setUnderlineWidth] = useState<number>(2); // 1px to 8px
   const [showUnderlinePopover, setShowUnderlinePopover] = useState<boolean>(false);
 
@@ -1413,7 +1450,7 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
   const [noteFontSize, setNoteFontSize] = useState<number>(14);
 
   // General drawing color
-  const [selectedColor, setSelectedColor] = useState<string>('#ef4444');
+  const [selectedColor, setSelectedColor] = useState<string>('#dc2626');
   const [strokeWidth, setStrokeWidth] = useState<number>(3);
 
   // Page dimension caching & virtualization
@@ -2117,7 +2154,7 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
             end: { x: ann.endPoint.x, y: pdfPageHeight - ann.endPoint.y },
             thickness: (ann.strokeWidth || 3) * 4.5,
             color: rgb(r, g, b),
-            opacity: ann.opacity !== undefined ? ann.opacity : 0.30,
+            opacity: ann.opacity !== undefined ? ann.opacity : 0.95,
           });
         } else if ((ann.type === 'draw' || ann.type === 'highlight') && ann.points && ann.points.length > 1) {
           for (let i = 0; i < ann.points.length - 1; i++) {
@@ -2128,7 +2165,7 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
               end: { x: p2.x, y: pdfPageHeight - p2.y },
               thickness: ann.type === 'highlight' ? ann.strokeWidth * 4.5 : ann.strokeWidth,
               color: rgb(r, g, b),
-              opacity: ann.type === 'highlight' ? (ann.opacity !== undefined ? ann.opacity : 0.30) : 1.0,
+              opacity: ann.type === 'highlight' ? (ann.opacity !== undefined ? ann.opacity : 0.95) : 1.0,
             });
           }
         }
@@ -2568,10 +2605,11 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
                 borderLeft: '1px solid rgba(255,255,255,0.1)',
                 background: showHighlightPopover ? 'var(--bg-active)' : undefined,
               }}
-              title="Highlighter Colors & 5 Strength Divisions"
+              title="Highlighter Colors & Strength Levels"
             >
               <ChevronDown size={13} />
-            </button>              {/* Highlight Settings Popover with Mode, Color, Width & 5 Strength Divisions */}
+            </button>
+            {/* Highlight Settings Popover with Mode, Color, Width & Strength Divisions */}
             {showHighlightPopover && (
               <div
                 onClick={(e) => e.stopPropagation()}
@@ -2587,6 +2625,8 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
                   boxShadow: 'var(--shadow-lg)',
                   zIndex: 120,
                   width: '270px',
+                  maxHeight: '80vh',
+                  overflowY: 'auto',
                   display: 'flex',
                   flexDirection: 'column',
                   gap: '10px',
@@ -2710,42 +2750,95 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
                   ))}
                 </div>
 
-                <div style={{ fontSize: '11px', fontWeight: 700, color: 'var(--text-secondary)', textTransform: 'uppercase', marginTop: '4px' }}>
-                  Highlight Strength (5 Divisions)
-                </div>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-                  {HIGHLIGHT_STRENGTHS.map((s) => (
-                    <button
-                      key={s.value}
-                      onClick={() => {
-                        setHighlightStrength(s.value);
+                {/* 15-Step Variable Strength Selection Line */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginTop: '4px' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <span style={{ fontSize: '11px', fontWeight: 700, color: 'var(--text-secondary)', textTransform: 'uppercase' }}>
+                      Highlight Strength
+                    </span>
+                    <span style={{ fontSize: '11px', fontWeight: 600, color: '#60a5fa' }}>
+                      Level {HIGHLIGHT_STRENGTHS.find((s) => Math.abs(s.value - highlightStrength) < 0.01)?.level || 15} / 15
+                    </span>
+                  </div>
+
+                  {/* Dynamic Color & Transparency Live Preview Bar */}
+                  <div
+                    style={{
+                      width: '100%',
+                      height: '14px',
+                      backgroundColor: highlightColor,
+                      opacity: highlightStrength,
+                      borderRadius: '3px',
+                      border: '1px solid rgba(255, 255, 255, 0.15)',
+                    }}
+                    title={`Current highlight opacity: ${Math.round(highlightStrength * 100)}%`}
+                  />
+
+                  {/* Continuous Range Slider Selection Line */}
+                  <input
+                    type="range"
+                    min="1"
+                    max="15"
+                    step="1"
+                    value={HIGHLIGHT_STRENGTHS.find((s) => Math.abs(s.value - highlightStrength) < 0.01)?.level || 15}
+                    onChange={(e) => {
+                      const lvl = parseInt(e.target.value, 10);
+                      const match = HIGHLIGHT_STRENGTHS.find((s) => s.level === lvl);
+                      if (match) {
+                        setHighlightStrength(match.value);
                         setActiveTool('highlight');
-                      }}
-                      style={{
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'space-between',
-                        padding: '4px 8px',
-                        borderRadius: '4px',
-                        fontSize: '12px',
-                        background: highlightStrength === s.value ? 'rgba(59, 130, 246, 0.2)' : 'transparent',
-                        color: highlightStrength === s.value ? '#60a5fa' : 'var(--text-primary)',
-                        border: 'none',
-                        cursor: 'pointer',
-                      }}
-                    >
-                      <span>{s.label}</span>
-                      <div
-                        style={{
-                          width: '50px',
-                          height: s.height,
-                          backgroundColor: highlightColor,
-                          opacity: s.value,
-                          borderRadius: '2px',
-                        }}
-                      />
-                    </button>
-                  ))}
+                      }
+                    }}
+                    style={{
+                      width: '100%',
+                      accentColor: '#3b82f6',
+                      cursor: 'pointer',
+                    }}
+                  />
+
+                  {/* 15 Variable Selection Steps Row */}
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(15, 1fr)', gap: '2px' }}>
+                    {HIGHLIGHT_STRENGTHS.map((s) => {
+                      const isSelected = Math.abs(highlightStrength - s.value) < 0.01;
+                      return (
+                        <button
+                          key={s.level}
+                          onClick={() => {
+                            setHighlightStrength(s.value);
+                            setActiveTool('highlight');
+                          }}
+                          title={`Strength Level ${s.level} (${Math.round(s.value * 100)}%)`}
+                          style={{
+                            display: 'flex',
+                            flexDirection: 'column',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            padding: '4px 0',
+                            borderRadius: '3px',
+                            fontSize: '10px',
+                            fontWeight: isSelected ? 700 : 500,
+                            background: isSelected ? 'rgba(59, 130, 246, 0.35)' : 'rgba(255, 255, 255, 0.05)',
+                            color: isSelected ? '#60a5fa' : 'var(--text-secondary)',
+                            border: isSelected ? '1px solid #3b82f6' : '1px solid rgba(255, 255, 255, 0.08)',
+                            cursor: 'pointer',
+                            transition: 'all 0.15s ease',
+                          }}
+                        >
+                          <span>{s.level}</span>
+                          <div
+                            style={{
+                              width: '10px',
+                              height: '2.5px',
+                              marginTop: '2px',
+                              backgroundColor: highlightColor,
+                              opacity: s.value,
+                              borderRadius: '1px',
+                            }}
+                          />
+                        </button>
+                      );
+                    })}
+                  </div>
                 </div>
               </div>
             )}
