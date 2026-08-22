@@ -1644,6 +1644,12 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
         top: (targetPage - 1) * defaultPageH,
         behavior: 'smooth',
       });
+      setTimeout(() => {
+        const renderedEl = document.getElementById(`pdf-page-${targetPage}`);
+        if (renderedEl) {
+          renderedEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+      }, 50);
     }
   }, [numPages, file.id, file.name, defaultDimensions.height, scale]);
 
@@ -1783,6 +1789,36 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
       stopInertia();
     };
   }, [scrollSpeed, handleEndDragScroll, stopInertia]);
+
+  // Keyboard navigation for PDF reading: Left & Right arrow keys to scroll one page up / down
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Do not intercept if user is typing in an input, textarea, or editable element
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+
+      if (e.key === 'ArrowLeft' || e.key === 'PageUp') {
+        e.preventDefault();
+        scrollToPage(currentPage - 1);
+      } else if (e.key === 'ArrowRight' || e.key === 'PageDown') {
+        e.preventDefault();
+        scrollToPage(currentPage + 1);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [currentPage, scrollToPage]);
 
   // Compile annotations into valid PDF binary across all pages
   const exportModifiedPdf = async (updatedAnnotations: AnnotationItem[]): Promise<Blob> => {
