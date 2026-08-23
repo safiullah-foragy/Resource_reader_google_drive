@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo, useLayoutEffect } from 'react';
-import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
+import { PDFDocument, rgb, StandardFonts, BlendMode, LineCapStyle } from 'pdf-lib';
 import * as pdfjsLib from 'pdfjs-dist';
 import pdfjsWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { 
@@ -2294,17 +2294,22 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
             thickness: (ann.strokeWidth || 3) * 4.5,
             color: rgb(r, g, b),
             opacity: ann.opacity !== undefined ? ann.opacity : 0.95,
+            blendMode: BlendMode.Multiply,
+            lineCap: LineCapStyle.Butt,
           });
         } else if ((ann.type === 'draw' || ann.type === 'highlight') && ann.points && ann.points.length > 1) {
+          const isHighlight = ann.type === 'highlight';
           for (let i = 0; i < ann.points.length - 1; i++) {
             const p1 = ann.points[i];
             const p2 = ann.points[i + 1];
             targetPage.drawLine({
               start: { x: p1.x, y: pdfPageHeight - p1.y },
               end: { x: p2.x, y: pdfPageHeight - p2.y },
-              thickness: ann.type === 'highlight' ? ann.strokeWidth * 4.5 : ann.strokeWidth,
+              thickness: isHighlight ? (ann.strokeWidth || 3) * 4.5 : (ann.strokeWidth || 2),
               color: rgb(r, g, b),
-              opacity: ann.type === 'highlight' ? (ann.opacity !== undefined ? ann.opacity : 0.95) : 1.0,
+              opacity: isHighlight ? (ann.opacity !== undefined ? ann.opacity : 0.95) : 1.0,
+              blendMode: isHighlight ? BlendMode.Multiply : BlendMode.Normal,
+              lineCap: LineCapStyle.Round,
             });
           }
         }
