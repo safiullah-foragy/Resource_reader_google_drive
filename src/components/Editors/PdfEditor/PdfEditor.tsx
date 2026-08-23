@@ -1628,7 +1628,11 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
     let isCancelled = false;
     setIsLoadingPdf(true);
     setLoadError(null);
-    onHasUnsavedChanges(false);
+    if (annotations.length > 0) {
+      onHasUnsavedChanges(true);
+    } else {
+      onHasUnsavedChanges(false);
+    }
 
     async function loadPdf() {
       try {

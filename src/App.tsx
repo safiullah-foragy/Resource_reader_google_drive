@@ -55,11 +55,12 @@ export function App() {
     return localStorage.getItem('studio_active_tab_id_v1') || 'explorer';
   });
 
-  // Unsaved changes confirmation modal state
-  type PendingLeaveAction =
-    | { type: 'close-tab'; docId: string; fileName: string }
-    | { type: 'switch-tab'; targetTabId: string; fromDocId: string; fileName: string }
-    | { type: 'back-to-explorer'; fromDocId: string; fileName: string };
+  // Unsaved changes confirmation modal state (only when closing a tab with unsaved updates)
+  type PendingLeaveAction = {
+    type: 'close-tab';
+    docId: string;
+    fileName: string;
+  };
 
   const [pendingLeaveAction, setPendingLeaveAction] = useState<PendingLeaveAction | null>(null);
   const [isUnsavedModalSaving, setIsUnsavedModalSaving] = useState<boolean>(false);
@@ -588,85 +589,55 @@ export function App() {
     executeCloseTab(docId);
   };
 
-  // Switch Tab (Intercepts if active document has unsaved updates)
+  // Switch Tab (Directly switches tabs without popup modal, preserving unsaved changes in tabs)
   const handleRequestSelectTab = (targetTabId: string) => {
     if (targetTabId === activeTabId) return;
-
-    if (activeDocument?.hasUnsavedChanges && targetTabId !== activeDocument.id) {
-      setPendingLeaveAction({
-        type: 'switch-tab',
-        targetTabId,
-        fromDocId: activeDocument.id,
-        fileName: activeDocument.file.name,
-      });
-      return;
-    }
-
     setActiveTabId(targetTabId);
   };
 
-  // Back to Files / Explorer (Intercepts if active document has unsaved updates)
+  // Back to Files / Explorer (Directly switches view without popup modal, preserving open tabs)
   const handleRequestBackToExplorer = () => {
-    if (activeDocument?.hasUnsavedChanges) {
-      setPendingLeaveAction({
-        type: 'back-to-explorer',
-        fromDocId: activeDocument.id,
-        fileName: activeDocument.file.name,
-      });
-      return;
-    }
-
     setActiveTabId('explorer');
   };
 
-  // Unsaved Changes Modal Option 1: Save & Continue
+  // Unsaved Changes Modal Option 1: Save & Close Tab
   const handleModalSaveAndContinue = async () => {
     if (!pendingLeaveAction) return;
 
     setIsUnsavedModalSaving(true);
     try {
-      await handleSaveToDrive();
       const action = pendingLeaveAction;
-      setPendingLeaveAction(null);
-
-      if (action.type === 'close-tab') {
-        executeCloseTab(action.docId);
-      } else if (action.type === 'switch-tab') {
-        setActiveTabId(action.targetTabId);
-      } else if (action.type === 'back-to-explorer') {
-        setActiveTabId('explorer');
+      const targetDoc = openDocuments.find((d) => d.id === action.docId);
+      if (targetDoc) {
+        await handleSaveDocument(targetDoc);
       }
+      setPendingLeaveAction(null);
+      executeCloseTab(action.docId);
     } catch (err: any) {
-      console.error('Save before leaving failed:', err);
-      showToast('error', 'Save Failed', err.message || 'Could not save before leaving.');
+      console.error('Save before closing failed:', err);
+      showToast('error', 'Save Failed', err.message || 'Could not save before closing.');
     } finally {
       setIsUnsavedModalSaving(false);
     }
   };
 
-  // Unsaved Changes Modal Option 2: Continue without Saving (Discard)
+  // Unsaved Changes Modal Option 2: Continue without Saving (Discard & Close Tab)
   const handleModalContinueWithoutSaving = () => {
     if (!pendingLeaveAction) return;
 
     const action = pendingLeaveAction;
-    if (action.type === 'close-tab') {
-      executeCloseTab(action.docId);
-    } else if (action.type === 'switch-tab') {
-      setOpenDocuments((prev) =>
-        prev.map((d) => (d.id === action.fromDocId ? { ...d, hasUnsavedChanges: false, saveStatus: 'idle' } : d))
-      );
-      setActiveTabId(action.targetTabId);
-    } else if (action.type === 'back-to-explorer') {
-      setOpenDocuments((prev) =>
-        prev.map((d) => (d.id === action.fromDocId ? { ...d, hasUnsavedChanges: false, saveStatus: 'idle' } : d))
-      );
-      setActiveTabId('explorer');
+    const docToClose = openDocuments.find((d) => d.id === action.docId);
+    if (docToClose) {
+      try {
+        localStorage.removeItem(`pdf_annotations_${docToClose.file.id || docToClose.file.name}`);
+      } catch (e) {}
     }
 
+    executeCloseTab(action.docId);
     setPendingLeaveAction(null);
   };
 
-  // Unsaved Changes Modal Option 3: Close (Stay Here)
+  // Unsaved Changes Modal Option 3: Close (Stay on Tab)
   const handleModalClose = () => {
     setPendingLeaveAction(null);
   };
@@ -712,15 +683,15 @@ export function App() {
   };
 
   // Save to Google Drive or In-Place to Local Disk
-  const handleSaveToDrive = async () => {
-    if (!activeDocument) return;
+  const handleSaveDocument = async (docToSave: OpenDocument) => {
+    if (!docToSave) return;
 
     setOpenDocuments((prev) =>
-      prev.map((d) => (d.id === activeDocument.id ? { ...d, saveStatus: 'saving' } : d))
+      prev.map((d) => (d.id === docToSave.id ? { ...d, saveStatus: 'saving' } : d))
     );
 
     try {
-      const { file, modifiedBlob } = activeDocument;
+      const { file, modifiedBlob } = docToSave;
 
       // 1. If opened via File System Access API handle (Local C:, D:, G: drive), save in-place directly to disk!
       if (file.fileHandle && typeof file.fileHandle.createWritable === 'function') {
@@ -732,7 +703,7 @@ export function App() {
           const newBuffer = await blobToArrayBuffer(modifiedBlob);
           setOpenDocuments((prev) =>
             prev.map((d) =>
-              d.id === activeDocument.id
+              d.id === docToSave.id
                 ? {
                     ...d,
                     arrayBuffer: newBuffer,
@@ -770,7 +741,7 @@ export function App() {
 
         setOpenDocuments((prev) =>
           prev.map((d) =>
-            d.id === activeDocument.id
+            d.id === docToSave.id
               ? {
                   ...d,
                   arrayBuffer: newBuffer,
@@ -796,16 +767,16 @@ export function App() {
 
       // 3. Connected to Google Drive or Offline: Cache binary buffer locally first!
       const newBuffer = await blobToArrayBuffer(modifiedBlob);
-      await fileBufferCache.set(activeDocument.id, newBuffer);
+      await fileBufferCache.set(docToSave.id, newBuffer);
 
       // If offline, queue for background sync when connection returns
       if (!navigator.onLine) {
         if (!file.id.startsWith('local_')) {
           await fileBufferCache.queueOfflineSync({
-            fileId: activeDocument.file.id,
-            fileName: activeDocument.file.name,
-            mimeType: activeDocument.file.mimeType,
-            driveAccountId: activeDocument.driveAccountId,
+            fileId: docToSave.file.id,
+            fileName: docToSave.file.name,
+            mimeType: docToSave.file.mimeType,
+            driveAccountId: docToSave.driveAccountId,
             modifiedTime: new Date().toISOString(),
             buffer: newBuffer,
           });
@@ -813,7 +784,7 @@ export function App() {
 
         setOpenDocuments((prev) =>
           prev.map((d) =>
-            d.id === activeDocument.id
+            d.id === docToSave.id
               ? {
                   ...d,
                   arrayBuffer: newBuffer,
@@ -852,13 +823,13 @@ export function App() {
           file.name,
           file.mimeType,
           modifiedBlob,
-          activeDocument.driveAccountId || file.driveAccountId
+          docToSave.driveAccountId || file.driveAccountId
         );
       }
 
       setOpenDocuments((prev) =>
         prev.map((d) =>
-          d.id === activeDocument.id
+          d.id === docToSave.id
             ? {
                 ...d,
                 id: updated.id,
@@ -877,7 +848,7 @@ export function App() {
         )
       );
 
-      if (updated.id !== file.id) {
+      if (updated.id !== file.id && activeTabId === docToSave.id) {
         setActiveTabId(updated.id);
       }
 
@@ -887,21 +858,21 @@ export function App() {
     } catch (err: any) {
       console.warn('Save to Drive encountered an issue, storing in offline cache:', err);
       try {
-        const fallbackBuffer = await blobToArrayBuffer(activeDocument.modifiedBlob);
-        await fileBufferCache.set(activeDocument.id, fallbackBuffer);
-        if (!activeDocument.file.id.startsWith('local_')) {
+        const fallbackBuffer = await blobToArrayBuffer(docToSave.modifiedBlob);
+        await fileBufferCache.set(docToSave.id, fallbackBuffer);
+        if (!docToSave.file.id.startsWith('local_')) {
           await fileBufferCache.queueOfflineSync({
-            fileId: activeDocument.file.id,
-            fileName: activeDocument.file.name,
-            mimeType: activeDocument.file.mimeType,
-            driveAccountId: activeDocument.driveAccountId,
+            fileId: docToSave.file.id,
+            fileName: docToSave.file.name,
+            mimeType: docToSave.file.mimeType,
+            driveAccountId: docToSave.driveAccountId,
             modifiedTime: new Date().toISOString(),
             buffer: fallbackBuffer,
           });
         }
         setOpenDocuments((prev) =>
           prev.map((d) =>
-            d.id === activeDocument.id
+            d.id === docToSave.id
               ? {
                   ...d,
                   arrayBuffer: fallbackBuffer,
@@ -911,14 +882,19 @@ export function App() {
               : d
           )
         );
-        showToast('info', 'Saved in Offline Cache', `Network issue detected. "${activeDocument.file.name}" was saved locally and queued for automatic sync when online.`);
+        showToast('info', 'Saved in Offline Cache', `Network issue detected. "${docToSave.file.name}" was saved locally and queued for automatic sync when online.`);
       } catch (cacheErr) {
         setOpenDocuments((prev) =>
-          prev.map((d) => (d.id === activeDocument.id ? { ...d, saveStatus: 'error' } : d))
+          prev.map((d) => (d.id === docToSave.id ? { ...d, saveStatus: 'error' } : d))
         );
         showToast('error', 'Save Failed', err.message || 'Failed to update file.');
       }
     }
+  };
+
+  const handleSaveToDrive = async () => {
+    if (!activeDocument) return;
+    await handleSaveDocument(activeDocument);
   };
 
   // Global Keyboard Shortcut: Ctrl+S / Cmd+S to Save to Drive / Disk
