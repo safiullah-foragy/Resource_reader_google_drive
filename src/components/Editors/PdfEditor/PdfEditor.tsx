@@ -1522,7 +1522,33 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
 }) => {
   const [numPages, setNumPages] = useState<number>(0);
   const [currentPage, setCurrentPage] = useState<number>(1);
-  const [scale, setScale] = useState<number>(1.2);
+  const [scale, setScale] = useState<number>(() => {
+    try {
+      const storageKey = `pdf_last_scale_${file.id || file.name}`;
+      const saved = localStorage.getItem(storageKey);
+      if (saved) {
+        const parsed = parseFloat(saved);
+        if (!isNaN(parsed) && parsed >= 0.4 && parsed <= 3.0) {
+          return parsed;
+        }
+      }
+    } catch (e) {
+      console.warn('Could not read saved pdf scale:', e);
+    }
+    return 1.2;
+  });
+
+  // Persist zoom level per document so switching tabs preserves user zoom state
+  useEffect(() => {
+    if (scale) {
+      try {
+        const storageKey = `pdf_last_scale_${file.id || file.name}`;
+        localStorage.setItem(storageKey, scale.toString());
+      } catch (e) {
+        console.warn('Could not save pdf scale:', e);
+      }
+    }
+  }, [scale, file.id, file.name]);
   const [activeTool, setActiveTool] = useState<AnnotationTool | 'none'>('draw');
 
   // Custom Dynamic Drag-Scroll Speed (0.5x to 4.0x)
