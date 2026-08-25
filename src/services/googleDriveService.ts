@@ -21,10 +21,37 @@ class GoogleDriveService {
 
   private accounts: ConnectedDriveAccount[] = [];
   private activeAccountId: string | null = null;
+  private refreshPromise: Map<string, Promise<string>> = new Map();
+  private autoRefreshTimer: any = null;
 
   constructor() {
     this.loadSavedCredentials();
     this.loadAccounts();
+    this.startAutoTokenRefresh();
+  }
+
+  /**
+   * Background token refresher to silently extend session before token expires (1 hour lifetime)
+   */
+  private startAutoTokenRefresh(): void {
+    if (typeof window === 'undefined') return;
+    if (this.autoRefreshTimer) {
+      clearInterval(this.autoRefreshTimer);
+    }
+
+    // Check every 4 minutes if active account's token is expiring within 8 minutes
+    this.autoRefreshTimer = setInterval(() => {
+      if (document.visibilityState !== 'visible' || !navigator.onLine) return;
+      const active = this.getActiveAccount();
+      if (active && active.token && active.tokenExpires) {
+        const remaining = active.tokenExpires - Date.now();
+        if (remaining < 8 * 60 * 1000) {
+          this.refreshToken(active.id, false).catch((err) => {
+            console.debug('Background silent token refresh notice:', err);
+          });
+        }
+      }
+    }, 4 * 60 * 1000);
   }
 
   public loadAccounts(): ConnectedDriveAccount[] {
@@ -126,6 +153,10 @@ class GoogleDriveService {
     this.accessToken = null;
     this.accounts = [];
     this.activeAccountId = null;
+    if (this.autoRefreshTimer) {
+      clearInterval(this.autoRefreshTimer);
+      this.autoRefreshTimer = null;
+    }
     localStorage.removeItem('drive_studio_google_creds');
     localStorage.removeItem('drive_studio_connected_accounts');
     localStorage.removeItem('drive_studio_active_account_id');
@@ -137,14 +168,15 @@ class GoogleDriveService {
     return this.credentials;
   }
 
-  public isConnected(): boolean {
-    const active = this.getActiveAccount();
-    if (!active || !active.token) return false;
-    if (active.tokenExpires && active.tokenExpires < Date.now()) {
-      this.removeAccount(active.id);
-      return false;
+  /**
+   * Check if user has an active connected Google Drive account.
+   * Does NOT aggressively delete accounts on expired tokens.
+   */
+  public isConnected(accountId?: string): boolean {
+    if (accountId && accountId !== 'local') {
+      return this.accounts.some((a) => a.id === accountId || a.email === accountId);
     }
-    return true;
+    return !!this.getActiveAccount();
   }
 
   public getAccessToken(accountId?: string): string | null {
@@ -214,13 +246,158 @@ class GoogleDriveService {
     }
   }
 
+  /**
+   * Refreshes or requests a token for a given account.
+   * If interactive=false, requests silently without prompting if possible.
+   */
+  public async refreshToken(accountId?: string, interactive: boolean = false): Promise<string> {
+    const target = accountId && accountId !== 'local'
+      ? this.accounts.find((a) => a.id === accountId || a.email === accountId)
+      : this.getActiveAccount();
+
+    if (!target) {
+      throw new Error('No Google Drive account connected. Please connect your Google Drive.');
+    }
+
+    const accId = target.id;
+    if (this.refreshPromise.has(accId)) {
+      return this.refreshPromise.get(accId)!;
+    }
+
+    const task = (async () => {
+      await this.initializeGis();
+      if (!this.tokenClient) {
+        throw new Error('Google Identity Services client is not available yet.');
+      }
+
+      return new Promise<string>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          reject(new Error('Token refresh request timed out.'));
+        }, 15000);
+
+        this.tokenClient.callback = async (resp: any) => {
+          clearTimeout(timeout);
+          if (resp.error) {
+            console.warn('GIS token request response error:', resp.error, resp.error_description);
+            return reject(new Error(resp.error_description || resp.error));
+          }
+
+          const token = resp.access_token;
+          const expiresIn = resp.expires_in ? parseInt(resp.expires_in, 10) : 3500;
+          const tokenExpires = Date.now() + expiresIn * 1000;
+
+          // Update target account in state and storage
+          target.token = token;
+          target.tokenExpires = tokenExpires;
+
+          const idx = this.accounts.findIndex((a) => a.id === target.id);
+          if (idx >= 0) {
+            this.accounts[idx] = { ...target };
+          }
+
+          if (this.activeAccountId === target.id) {
+            this.accessToken = token;
+          }
+
+          this.saveAccounts();
+          resolve(token);
+        };
+
+        try {
+          if (interactive) {
+            this.tokenClient.requestAccessToken({
+              prompt: 'select_account consent',
+              hint: target.email,
+            });
+          } else {
+            // Silent renewal with empty prompt and email hint
+            this.tokenClient.requestAccessToken({
+              prompt: '',
+              hint: target.email,
+            });
+          }
+        } catch (err) {
+          clearTimeout(timeout);
+          reject(err);
+        }
+      });
+    })().finally(() => {
+      this.refreshPromise.delete(accId);
+    });
+
+    this.refreshPromise.set(accId, task);
+    return task;
+  }
+
+  /**
+   * Ensures an account has a valid, non-expired access token before making Google Drive API requests.
+   * Silently refreshes if token is expiring within 2 minutes or has expired.
+   */
+  public async ensureValidToken(accountId?: string): Promise<string> {
+    const target = accountId && accountId !== 'local'
+      ? this.accounts.find((a) => a.id === accountId || a.email === accountId)
+      : this.getActiveAccount();
+
+    if (!target) {
+      throw new Error('Please connect your Google Drive account.');
+    }
+
+    const now = Date.now();
+    // Valid for at least another 2 minutes (120,000ms)
+    if (target.token && target.tokenExpires && target.tokenExpires - now > 120 * 1000) {
+      return target.token;
+    }
+
+    // Token is close to expiring or already expired -> attempt silent renewal
+    try {
+      const freshToken = await this.refreshToken(target.id, false);
+      return freshToken;
+    } catch (silentErr) {
+      console.warn('Silent token renewal failed; evaluating fallback:', silentErr);
+      // If current token hasn't fully expired yet, allow trying it
+      if (target.token && target.tokenExpires && target.tokenExpires > now) {
+        return target.token;
+      }
+      throw new Error('Google Drive session expired. Please reconnect to Google Drive.');
+    }
+  }
+
+  /**
+   * Wrapper for making authenticated fetch requests with automatic 401 retry & token renewal
+   */
+  private async fetchWithAuth(
+    url: string,
+    options: RequestInit = {},
+    accountId?: string
+  ): Promise<Response> {
+    let token = await this.ensureValidToken(accountId);
+    const headers = new Headers(options.headers || {});
+    headers.set('Authorization', `Bearer ${token}`);
+
+    let response = await fetch(url, { ...options, headers });
+
+    if (response.status === 401) {
+      console.warn('Google Drive API returned 401; attempting silent token refresh retry...');
+      try {
+        token = await this.refreshToken(accountId, false);
+        const retryHeaders = new Headers(options.headers || {});
+        retryHeaders.set('Authorization', `Bearer ${token}`);
+        response = await fetch(url, { ...options, headers: retryHeaders });
+      } catch (retryErr) {
+        console.warn('Retry on 401 failed:', retryErr);
+      }
+    }
+
+    return response;
+  }
+
   public async login(): Promise<string> {
     const account = await this.loginNewAccount();
     return account.token;
   }
 
   /**
-   * Connect a new or additional Google Drive account
+   * Connect a new or additional Google Drive account with interactive consent
    */
   public async loginNewAccount(): Promise<ConnectedDriveAccount> {
     if (!this.credentials?.clientId) {
@@ -284,7 +461,7 @@ class GoogleDriveService {
           resolve(account);
         };
 
-        // Always prompt account selection and consent so users must explicitly authenticate each time
+        // Prompt account selection and consent
         this.tokenClient.requestAccessToken({ prompt: 'select_account consent' });
       } catch (err) {
         reject(err);
@@ -299,11 +476,6 @@ class GoogleDriveService {
   }
 
   public async listFiles(folderId: string = 'root', searchQuery?: string, accountId?: string): Promise<DriveFile[]> {
-    const token = this.getAccessToken(accountId);
-    if (!token) {
-      throw new Error('Authentication expired. Please connect to Google Drive.');
-    }
-
     let q = "trashed = false";
     if (searchQuery && searchQuery.trim()) {
       q += ` and name contains '${searchQuery.replace(/'/g, "\\'")}'`;
@@ -314,16 +486,11 @@ class GoogleDriveService {
     const fields = 'files(id, name, mimeType, size, modifiedTime, iconLink, thumbnailLink, parents)';
     const url = `https://www.googleapis.com/drive/v3/files?q=${encodeURIComponent(q)}&fields=${encodeURIComponent(fields)}&pageSize=1000&orderBy=folder,name`;
 
-    const response = await fetch(url, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
-    });
+    const response = await this.fetchWithAuth(url, {}, accountId);
 
     if (!response.ok) {
       if (response.status === 401) {
-        this.logout();
-        throw new Error('Authentication expired. Please connect to Google Drive.');
+        throw new Error('Authentication expired. Please reconnect to Google Drive.');
       }
       const errJson = await response.json().catch(() => ({}));
       throw new Error(errJson.error?.message || `Failed to fetch files: ${response.statusText}`);
@@ -351,7 +518,7 @@ class GoogleDriveService {
   public async downloadFile(
     fileId: string,
     mimeType?: string,
-    onProgress?: (receivedBytes: number, totalBytes: number) => void,
+    _onProgress?: (receivedBytes: number, totalBytes: number) => void,
     accountId?: string
   ): Promise<{ data: ArrayBuffer; mimeType: string }> {
     const effectiveMime = mimeType || 'application/octet-stream';
@@ -360,11 +527,6 @@ class GoogleDriveService {
     const cachedData = await fileBufferCache.get(fileId);
     if (cachedData && cachedData.byteLength > 0) {
       return { data: cachedData, mimeType: effectiveMime };
-    }
-
-    const token = this.getAccessToken(accountId);
-    if (!token) {
-      throw new Error('Not authenticated with Google Drive.');
     }
 
     // Check if it's a native Google Docs / Sheets / Slides file
@@ -376,11 +538,7 @@ class GoogleDriveService {
       downloadUrl = `https://www.googleapis.com/drive/v3/files/${fileId}/export?mimeType=application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`;
     }
 
-    const response = await fetch(downloadUrl, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
-    });
+    const response = await this.fetchWithAuth(downloadUrl, {}, accountId);
 
     if (!response.ok) {
       throw new Error(`Failed to download file from Google Drive (${response.status}: ${response.statusText})`);
@@ -408,28 +566,25 @@ class GoogleDriveService {
     content: Blob | ArrayBuffer,
     accountId?: string
   ): Promise<DriveFile> {
-    const token = this.getAccessToken(accountId);
-    if (!token) {
-      throw new Error('Authentication expired. Please connect to Google Drive.');
-    }
-
     const blobContent = content instanceof Blob ? content : new Blob([content], { type: mimeType });
 
     // Step 1: Upload the binary content directly to Google Drive via uploadType=media
     const uploadUrl = `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`;
 
-    const response = await fetch(uploadUrl, {
-      method: 'PATCH',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': mimeType || 'application/octet-stream',
+    const response = await this.fetchWithAuth(
+      uploadUrl,
+      {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': mimeType || 'application/octet-stream',
+        },
+        body: blobContent,
       },
-      body: blobContent,
-    });
+      accountId
+    );
 
     if (!response.ok) {
       if (response.status === 401) {
-        this.logout();
         throw new Error('Authentication expired. Please reconnect to Google Drive.');
       }
       const errJson = await response.json().catch(() => ({}));
@@ -439,14 +594,17 @@ class GoogleDriveService {
     // Step 2: If fileName was provided, update metadata name
     try {
       const metaUrl = `https://www.googleapis.com/drive/v3/files/${fileId}`;
-      const metaResp = await fetch(metaUrl, {
-        method: 'PATCH',
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'Content-Type': 'application/json; charset=UTF-8',
+      const metaResp = await this.fetchWithAuth(
+        metaUrl,
+        {
+          method: 'PATCH',
+          headers: {
+            'Content-Type': 'application/json; charset=UTF-8',
+          },
+          body: JSON.stringify({ name: fileName }),
         },
-        body: JSON.stringify({ name: fileName }),
-      });
+        accountId
+      );
       if (metaResp.ok) {
         const metaJson = await metaResp.json();
         return {
@@ -483,11 +641,6 @@ class GoogleDriveService {
     parentFolderId?: string,
     accountId?: string
   ): Promise<DriveFile> {
-    const token = this.getAccessToken(accountId);
-    if (!token) {
-      throw new Error('Authentication expired. Please connect to Google Drive.');
-    }
-
     // Step 1: Create file metadata
     const createMetaUrl = 'https://www.googleapis.com/drive/v3/files';
     const metaBody: any = {
@@ -498,18 +651,20 @@ class GoogleDriveService {
       metaBody.parents = [parentFolderId];
     }
 
-    const metaResp = await fetch(createMetaUrl, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json; charset=UTF-8',
+    const metaResp = await this.fetchWithAuth(
+      createMetaUrl,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json; charset=UTF-8',
+        },
+        body: JSON.stringify(metaBody),
       },
-      body: JSON.stringify(metaBody),
-    });
+      accountId
+    );
 
     if (!metaResp.ok) {
       if (metaResp.status === 401) {
-        this.logout();
         throw new Error('Authentication expired. Please reconnect to Google Drive.');
       }
       const errJson = await metaResp.json().catch(() => ({}));
@@ -522,14 +677,17 @@ class GoogleDriveService {
     const blobContent = content instanceof Blob ? content : new Blob([content], { type: mimeType });
     const uploadUrl = `https://www.googleapis.com/upload/drive/v3/files/${createdFile.id}?uploadType=media`;
 
-    const uploadResp = await fetch(uploadUrl, {
-      method: 'PATCH',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': mimeType || 'application/octet-stream',
+    const uploadResp = await this.fetchWithAuth(
+      uploadUrl,
+      {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': mimeType || 'application/octet-stream',
+        },
+        body: blobContent,
       },
-      body: blobContent,
-    });
+      accountId
+    );
 
     if (!uploadResp.ok) {
       const errJson = await uploadResp.json().catch(() => ({}));
@@ -550,11 +708,6 @@ class GoogleDriveService {
    * Create a new folder in Google Drive
    */
   public async createFolder(folderName: string, parentFolderId?: string, accountId?: string): Promise<DriveFile> {
-    const token = this.getAccessToken(accountId);
-    if (!token) {
-      throw new Error('Authentication expired. Please connect to Google Drive.');
-    }
-
     const createMetaUrl = 'https://www.googleapis.com/drive/v3/files';
     const metaBody: any = {
       name: folderName.trim(),
@@ -564,18 +717,20 @@ class GoogleDriveService {
       metaBody.parents = [parentFolderId];
     }
 
-    const response = await fetch(createMetaUrl, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json; charset=UTF-8',
+    const response = await this.fetchWithAuth(
+      createMetaUrl,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json; charset=UTF-8',
+        },
+        body: JSON.stringify(metaBody),
       },
-      body: JSON.stringify(metaBody),
-    });
+      accountId
+    );
 
     if (!response.ok) {
       if (response.status === 401) {
-        this.logout();
         throw new Error('Authentication expired. Please reconnect to Google Drive.');
       }
       const errJson = await response.json().catch(() => ({}));
@@ -600,29 +755,26 @@ class GoogleDriveService {
    * Copy a file in Google Drive
    */
   public async copyFile(fileId: string, destinationFolderId?: string, accountId?: string): Promise<DriveFile> {
-    const token = this.getAccessToken(accountId);
-    if (!token) {
-      throw new Error('Authentication expired. Please connect to Google Drive.');
-    }
-
     const copyUrl = `https://www.googleapis.com/drive/v3/files/${fileId}/copy`;
     const copyBody: any = {};
     if (destinationFolderId && destinationFolderId !== 'root') {
       copyBody.parents = [destinationFolderId];
     }
 
-    const response = await fetch(copyUrl, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json; charset=UTF-8',
+    const response = await this.fetchWithAuth(
+      copyUrl,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json; charset=UTF-8',
+        },
+        body: JSON.stringify(copyBody),
       },
-      body: JSON.stringify(copyBody),
-    });
+      accountId
+    );
 
     if (!response.ok) {
       if (response.status === 401) {
-        this.logout();
         throw new Error('Authentication expired. Please reconnect to Google Drive.');
       }
       const errJson = await response.json().catch(() => ({}));
@@ -646,26 +798,21 @@ class GoogleDriveService {
    * Move / Cut & Paste a file to another folder in Google Drive
    */
   public async moveFile(fileId: string, previousFolderId?: string, targetFolderId?: string, accountId?: string): Promise<DriveFile> {
-    const token = this.getAccessToken(accountId);
-    if (!token) {
-      throw new Error('Authentication expired. Please connect to Google Drive.');
-    }
-
     let moveUrl = `https://www.googleapis.com/drive/v3/files/${fileId}?addParents=${encodeURIComponent(targetFolderId || 'root')}`;
     if (previousFolderId && previousFolderId !== 'root') {
       moveUrl += `&removeParents=${encodeURIComponent(previousFolderId)}`;
     }
 
-    const response = await fetch(moveUrl, {
-      method: 'PATCH',
-      headers: {
-        Authorization: `Bearer ${token}`,
+    const response = await this.fetchWithAuth(
+      moveUrl,
+      {
+        method: 'PATCH',
       },
-    });
+      accountId
+    );
 
     if (!response.ok) {
       if (response.status === 401) {
-        this.logout();
         throw new Error('Authentication expired. Please reconnect to Google Drive.');
       }
       const errJson = await response.json().catch(() => ({}));
@@ -689,22 +836,17 @@ class GoogleDriveService {
    * Delete a file or folder in Google Drive
    */
   public async deleteFile(fileId: string, accountId?: string): Promise<void> {
-    const token = this.getAccessToken(accountId);
-    if (!token) {
-      throw new Error('Authentication expired. Please connect to Google Drive.');
-    }
-
     const deleteUrl = `https://www.googleapis.com/drive/v3/files/${fileId}`;
-    const response = await fetch(deleteUrl, {
-      method: 'DELETE',
-      headers: {
-        Authorization: `Bearer ${token}`,
+    const response = await this.fetchWithAuth(
+      deleteUrl,
+      {
+        method: 'DELETE',
       },
-    });
+      accountId
+    );
 
     if (!response.ok && response.status !== 204) {
       if (response.status === 401) {
-        this.logout();
         throw new Error('Authentication expired. Please reconnect to Google Drive.');
       }
       const errJson = await response.json().catch(() => ({}));
