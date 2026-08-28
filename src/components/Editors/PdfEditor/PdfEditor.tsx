@@ -1571,7 +1571,7 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
   // Highlight settings (Default is highest strength: Level 15 / 0.95)
   const [highlightColor, setHighlightColor] = useState<string>('#facc15');
   const [highlightStrength, setHighlightStrength] = useState<number>(0.95); // Default Level 15 (0.95)
-  const [highlightWidth, setHighlightWidth] = useState<number>(4.5); // 2 to 8.5
+  const [highlightWidth, setHighlightWidth] = useState<number>(3.2); // 2 to 8.5
   const [highlightMode, setHighlightMode] = useState<'fixed' | 'variable'>('fixed'); // 'fixed' = straight line, 'variable' = freehand cursor follow
   const [showHighlightPopover, setShowHighlightPopover] = useState<boolean>(false);
 
