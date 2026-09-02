@@ -1678,8 +1678,16 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
         }
 
         // 3. Try using arrayBuffer if intact
-        if (!rawData && arrayBuffer && arrayBuffer.byteLength > 0) {
-          rawData = new Uint8Array(arrayBuffer.slice(0));
+        if (!rawData && arrayBuffer) {
+          try {
+            if (arrayBuffer.byteLength > 0 && !(arrayBuffer as any).detached) {
+              const copy = new Uint8Array(arrayBuffer.byteLength);
+              copy.set(new Uint8Array(arrayBuffer));
+              rawData = copy;
+            }
+          } catch (e) {
+            console.warn('arrayBuffer was detached:', e);
+          }
         }
 
         // 4. Try re-downloading from Google Drive if remote file
@@ -1698,6 +1706,12 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
           throw new Error('PDF file buffer is empty or detached. Please close and re-open this file.');
         }
 
+        // Create an independent ArrayBuffer copy BEFORE PDF.js transfers rawData to its web worker!
+        const baseCopy = new Uint8Array(rawData.byteLength);
+        baseCopy.set(rawData);
+        cleanBaseBufferRef.current = baseCopy.buffer;
+        currentDocIdRef.current = docId;
+
         const loadingTask = pdfjsLib.getDocument({
           data: rawData,
           wasmUrl: '/pdfjs/wasm/',
@@ -1715,11 +1729,6 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
 
         const pdf = await loadingTask.promise;
         if (!isCancelled) {
-          cleanBaseBufferRef.current = rawData.buffer.slice(
-            rawData.byteOffset,
-            rawData.byteOffset + rawData.byteLength
-          ) as ArrayBuffer;
-          currentDocIdRef.current = docId;
           setPdfDocProxy(pdf);
           setNumPages(pdf.numPages);
           setIsLoadingPdf(false);
@@ -2189,12 +2198,17 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
   // Compile annotations into valid PDF binary across all pages
   const exportModifiedPdf = useCallback(async (updatedAnnotations: AnnotationItem[]): Promise<Blob> => {
     try {
-      const bufferToLoad = cleanBaseBufferRef.current || arrayBuffer;
-      if (!bufferToLoad || bufferToLoad.byteLength === 0) {
+      let bufferToLoad = cleanBaseBufferRef.current;
+      if (!bufferToLoad || bufferToLoad.byteLength === 0 || (bufferToLoad as any).detached) {
+        bufferToLoad = arrayBuffer;
+      }
+      if (!bufferToLoad || bufferToLoad.byteLength === 0 || (bufferToLoad as any).detached) {
         throw new Error('Cannot export PDF: source buffer not available.');
       }
 
-      const pdfDoc = await PDFDocument.load(bufferToLoad.slice(0));
+      const copy = new Uint8Array(bufferToLoad.byteLength);
+      copy.set(new Uint8Array(bufferToLoad));
+      const pdfDoc = await PDFDocument.load(copy.buffer);
       const font = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
       const fontRegular = await pdfDoc.embedFont(StandardFonts.Helvetica);
       const pages = pdfDoc.getPages();
@@ -2321,11 +2335,13 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
       }
 
       const pdfBytes = await pdfDoc.save();
-      const buffer = pdfBytes.buffer.slice(pdfBytes.byteOffset, pdfBytes.byteOffset + pdfBytes.byteLength) as ArrayBuffer;
-      return new Blob([buffer], { type: 'application/pdf' });
+      const pdfBufferCopy = new Uint8Array(pdfBytes.length);
+      pdfBufferCopy.set(pdfBytes);
+      return new Blob([pdfBufferCopy.buffer], { type: 'application/pdf' });
     } catch (err) {
       console.error('Failed to compile modified PDF:', err);
-      return new Blob([arrayBuffer], { type: 'application/pdf' });
+      const fallback = cleanBaseBufferRef.current || arrayBuffer;
+      return new Blob([fallback], { type: 'application/pdf' });
     }
   }, [arrayBuffer]);
 
