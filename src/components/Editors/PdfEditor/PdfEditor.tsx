@@ -136,6 +136,20 @@ const NOTE_COLORS = [
 
 const NOTE_FONT_SIZES = [11, 14, 18, 24, 32];
 
+// Returns dark text (#0f172a) for bright/light colors and white text (#ffffff) for dark colors
+function getContrastTextColor(hexColor: string): string {
+  try {
+    const hex = hexColor.replace('#', '');
+    const r = parseInt(hex.substring(0, 2), 16) || 0;
+    const g = parseInt(hex.substring(2, 4), 16) || 0;
+    const b = parseInt(hex.substring(4, 6), 16) || 0;
+    const yiq = (r * 299 + g * 587 + b * 114) / 1000;
+    return yiq >= 128 ? '#0f172a' : '#ffffff';
+  } catch (e) {
+    return '#0f172a';
+  }
+}
+
 // Note Modal State with full 4-way resize and position
 interface ActiveNoteModal {
   id?: string; // present if editing existing note
@@ -2629,7 +2643,19 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
               }}
               title="Pen / Freehand Draw (Click to toggle on/off)"
             >
-              <Pen size={15} />
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}>
+                <Pen size={14} />
+                <span
+                  style={{
+                    display: 'block',
+                    width: '14px',
+                    height: '2.5px',
+                    borderRadius: '1px',
+                    backgroundColor: penColor,
+                    marginTop: '2px',
+                  }}
+                />
+              </div>
               <span>Pen</span>
             </button>
             <button
@@ -2751,7 +2777,19 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
               }}
               title="Underline Text (Click to toggle on/off)"
             >
-              <UnderlineIcon size={15} />
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}>
+                <UnderlineIcon size={14} />
+                <span
+                  style={{
+                    display: 'block',
+                    width: '14px',
+                    height: '2.5px',
+                    borderRadius: '1px',
+                    backgroundColor: underlineColor,
+                    marginTop: '2px',
+                  }}
+                />
+              </div>
               <span>Underline</span>
             </button>
             <button
@@ -2870,10 +2908,31 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
                 borderTopRightRadius: 0,
                 borderBottomRightRadius: 0,
                 paddingRight: '6px',
+                ...(activeTool === 'highlight'
+                  ? {
+                      backgroundColor: highlightColor,
+                      color: getContrastTextColor(highlightColor),
+                      fontWeight: 600,
+                      boxShadow: `0 0 0 1px ${highlightColor}cc, 0 1px 3px rgba(0,0,0,0.25)`,
+                    }
+                  : {}),
               }}
               title="Highlighter (Click to toggle on/off)"
             >
-              <Highlighter size={15} />
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}>
+                <Highlighter size={14} />
+                <span
+                  style={{
+                    display: 'block',
+                    width: '14px',
+                    height: '2.5px',
+                    borderRadius: '1px',
+                    backgroundColor: activeTool === 'highlight' ? getContrastTextColor(highlightColor) : highlightColor,
+                    marginTop: '2px',
+                    opacity: activeTool === 'highlight' ? 0.75 : 1,
+                  }}
+                />
+              </div>
               <span>Highlight</span>
             </button>
             <button
@@ -2888,8 +2947,17 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
                 borderTopLeftRadius: 0,
                 borderBottomLeftRadius: 0,
                 padding: '0.4rem 4px',
-                borderLeft: '1px solid rgba(255,255,255,0.1)',
-                background: showHighlightPopover ? 'var(--bg-active)' : undefined,
+                borderLeft: activeTool === 'highlight'
+                  ? (getContrastTextColor(highlightColor) === '#0f172a' ? '1px solid rgba(0,0,0,0.18)' : '1px solid rgba(255,255,255,0.25)')
+                  : '1px solid rgba(255,255,255,0.1)',
+                ...(activeTool === 'highlight'
+                  ? {
+                      backgroundColor: highlightColor,
+                      color: getContrastTextColor(highlightColor),
+                    }
+                  : {
+                      background: showHighlightPopover ? 'var(--bg-active)' : undefined,
+                    }),
               }}
               title="Highlighter Colors & Strength Levels"
             >
