@@ -586,6 +586,12 @@ export function App() {
       return;
     }
 
+    if (docToClose) {
+      try {
+        localStorage.removeItem(`pdf_annotations_${docToClose.file.id || docToClose.file.name}`);
+      } catch (e) {}
+    }
+
     executeCloseTab(docId);
   };
 
@@ -692,6 +698,7 @@ export function App() {
 
     try {
       const { file, modifiedBlob } = docToSave;
+      const isPdf = file.fileType === 'pdf';
 
       // 1. If opened via File System Access API handle (Local C:, D:, G: drive), save in-place directly to disk!
       if (file.fileHandle && typeof file.fileHandle.createWritable === 'function') {
@@ -706,7 +713,7 @@ export function App() {
               d.id === docToSave.id
                 ? {
                     ...d,
-                    arrayBuffer: newBuffer,
+                    arrayBuffer: isPdf ? d.arrayBuffer : newBuffer,
                     file: {
                       ...d.file,
                       rawBlob: modifiedBlob,
@@ -728,6 +735,10 @@ export function App() {
             )
           );
 
+          try {
+            localStorage.removeItem(`pdf_annotations_${file.id || file.name}`);
+          } catch (e) {}
+
           showToast('success', 'Saved Directly to Local File!', `Updated "${file.name}" in place on your disk.`);
           return;
         } catch (localWriteErr: any) {
@@ -744,7 +755,7 @@ export function App() {
             d.id === docToSave.id
               ? {
                   ...d,
-                  arrayBuffer: newBuffer,
+                  arrayBuffer: isPdf ? d.arrayBuffer : newBuffer,
                   file: { ...d.file, rawBlob: modifiedBlob, size: modifiedBlob.size, modifiedTime: new Date().toISOString() },
                   hasUnsavedChanges: false,
                   saveStatus: 'saved',
@@ -760,6 +771,10 @@ export function App() {
               : f
           )
         );
+
+        try {
+          localStorage.removeItem(`pdf_annotations_${file.id || file.name}`);
+        } catch (e) {}
 
         showToast('success', 'Saved Directly in Local Cache!', 'File updated locally. Click "Download" to export or connect Google Drive to sync.');
         return;
@@ -787,7 +802,7 @@ export function App() {
             d.id === docToSave.id
               ? {
                   ...d,
-                  arrayBuffer: newBuffer,
+                  arrayBuffer: isPdf ? d.arrayBuffer : newBuffer,
                   file: {
                     ...d.file,
                     rawBlob: modifiedBlob,
@@ -800,6 +815,10 @@ export function App() {
               : d
           )
         );
+
+        try {
+          localStorage.removeItem(`pdf_annotations_${file.id || file.name}`);
+        } catch (e) {}
 
         showToast('info', 'Saved to Offline Cache', `"${file.name}" is stored safely in local memory and will automatically sync to Google Drive once reconnected.`);
         return;
@@ -833,7 +852,7 @@ export function App() {
             ? {
                 ...d,
                 id: updated.id,
-                arrayBuffer: newBuffer,
+                arrayBuffer: isPdf ? d.arrayBuffer : newBuffer,
                 file: {
                   ...d.file,
                   id: updated.id,
@@ -847,6 +866,13 @@ export function App() {
             : d
         )
       );
+
+      try {
+        localStorage.removeItem(`pdf_annotations_${file.id || file.name}`);
+        if (updated?.id) {
+          localStorage.removeItem(`pdf_annotations_${updated.id}`);
+        }
+      } catch (e) {}
 
       if (updated.id !== file.id && activeTabId === docToSave.id) {
         setActiveTabId(updated.id);
@@ -1602,6 +1628,7 @@ export function App() {
                 file={activeDocument.file}
                 arrayBuffer={activeDocument.arrayBuffer}
                 onModify={handleEditorModify}
+                hasUnsavedChanges={activeDocument.hasUnsavedChanges}
                 onHasUnsavedChanges={handleSetHasUnsavedChanges}
                 isHeaderCollapsed={isHeaderCollapsed}
                 onToggleCollapseHeader={() => setIsHeaderCollapsed((prev) => !prev)}

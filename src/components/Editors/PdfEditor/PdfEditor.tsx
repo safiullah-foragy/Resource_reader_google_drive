@@ -41,6 +41,7 @@ interface PdfEditorProps {
   file: DriveFile;
   arrayBuffer: ArrayBuffer;
   onModify: (newBlob: Blob) => void;
+  hasUnsavedChanges?: boolean;
   onHasUnsavedChanges: (hasChanges: boolean) => void;
   isHeaderCollapsed?: boolean;
   onToggleCollapseHeader?: () => void;
@@ -1516,6 +1517,7 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
   file,
   arrayBuffer,
   onModify,
+  hasUnsavedChanges,
   onHasUnsavedChanges,
   isHeaderCollapsed,
   onToggleCollapseHeader,
@@ -1607,13 +1609,18 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
   const undoStackRef = useRef<AnnotationItem[][]>([]);
   const redoStackRef = useRef<AnnotationItem[][]>([]);
 
+  // Keep an immutable reference to the pristine base PDF buffer for this document
+  const cleanBaseBufferRef = useRef<ArrayBuffer | null>(null);
+  const currentDocIdRef = useRef<string | null>(null);
+
   useEffect(() => {
-    if (annotations.length > 0) {
-      localStorage.setItem(`pdf_annotations_${file.id || file.name}`, JSON.stringify(annotations));
-    } else {
-      localStorage.removeItem(`pdf_annotations_${file.id || file.name}`);
+    const key = `pdf_annotations_${file.id || file.name}`;
+    if (hasUnsavedChanges && annotations.length > 0) {
+      localStorage.setItem(key, JSON.stringify(annotations));
+    } else if (hasUnsavedChanges === false) {
+      localStorage.removeItem(key);
     }
-  }, [annotations, file.id, file.name]);
+  }, [annotations, hasUnsavedChanges, file.id, file.name]);
 
   const [pdfDocProxy, setPdfDocProxy] = useState<any>(null);
   const [isLoadingPdf, setIsLoadingPdf] = useState<boolean>(true);
@@ -1626,11 +1633,18 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
   // Load entire PDF document with local worker & restore last-read page
   useEffect(() => {
     let isCancelled = false;
+    const docId = file.id || file.name;
+
+    // If PDF is already loaded for this exact document, do not reload upon save or prop updates!
+    if (pdfDocProxy && currentDocIdRef.current === docId) {
+      return;
+    }
+
     setIsLoadingPdf(true);
     setLoadError(null);
-    if (annotations.length > 0) {
+    if (annotations.length > 0 && !cleanBaseBufferRef.current) {
       onHasUnsavedChanges(true);
-    } else {
+    } else if (!cleanBaseBufferRef.current) {
       onHasUnsavedChanges(false);
     }
 
@@ -1701,6 +1715,11 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
 
         const pdf = await loadingTask.promise;
         if (!isCancelled) {
+          cleanBaseBufferRef.current = rawData.buffer.slice(
+            rawData.byteOffset,
+            rawData.byteOffset + rawData.byteLength
+          ) as ArrayBuffer;
+          currentDocIdRef.current = docId;
           setPdfDocProxy(pdf);
           setNumPages(pdf.numPages);
           setIsLoadingPdf(false);
@@ -1755,7 +1774,7 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
     return () => {
       isCancelled = true;
     };
-  }, [file.rawBlob, file.fileHandle, arrayBuffer, file.id, file.name]);
+  }, [file.id, file.name]);
 
   // Intelligent Background RAM Prefetcher: Pre-loads upcoming pages into System RAM for 0ms transitions
   useEffect(() => {
@@ -2168,28 +2187,14 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
   }, [currentPage, scrollToPage]);
 
   // Compile annotations into valid PDF binary across all pages
-  const exportModifiedPdf = async (updatedAnnotations: AnnotationItem[]): Promise<Blob> => {
+  const exportModifiedPdf = useCallback(async (updatedAnnotations: AnnotationItem[]): Promise<Blob> => {
     try {
-      let bufferToLoad: ArrayBuffer | null = null;
-      if (file.fileHandle && typeof file.fileHandle.getFile === 'function') {
-        try {
-          const f = await file.fileHandle.getFile();
-          bufferToLoad = await f.arrayBuffer();
-        } catch (e) {}
-      }
-      if (!bufferToLoad && file.rawBlob) {
-        try {
-          bufferToLoad = await file.rawBlob.arrayBuffer();
-        } catch (e) {}
-      }
-      if (!bufferToLoad && arrayBuffer && arrayBuffer.byteLength > 0) {
-        bufferToLoad = arrayBuffer.slice(0);
-      }
-      if (!bufferToLoad) {
+      const bufferToLoad = cleanBaseBufferRef.current || arrayBuffer;
+      if (!bufferToLoad || bufferToLoad.byteLength === 0) {
         throw new Error('Cannot export PDF: source buffer not available.');
       }
 
-      const pdfDoc = await PDFDocument.load(bufferToLoad);
+      const pdfDoc = await PDFDocument.load(bufferToLoad.slice(0));
       const font = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
       const fontRegular = await pdfDoc.embedFont(StandardFonts.Helvetica);
       const pages = pdfDoc.getPages();
@@ -2322,7 +2327,7 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
       console.error('Failed to compile modified PDF:', err);
       return new Blob([arrayBuffer], { type: 'application/pdf' });
     }
-  };
+  }, [arrayBuffer]);
 
   // Debounce PDF binary export so strokes and rapid edits stay 60fps fast
   const exportTimeoutRef = useRef<any>(null);
@@ -2333,9 +2338,9 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
       }
       exportTimeoutRef.current = setTimeout(() => {
         exportModifiedPdf(updatedAnnotations).then(onModify);
-      }, 500);
+      }, 200);
     },
-    [arrayBuffer, onModify]
+    [exportModifiedPdf, onModify]
   );
 
   useEffect(() => {
