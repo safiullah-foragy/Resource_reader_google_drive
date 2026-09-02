@@ -1551,7 +1551,25 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
       }
     }
   }, [scale, file.id, file.name]);
-  const [activeTool, setActiveTool] = useState<AnnotationTool | 'none'>('draw');
+  const [activeTool, setActiveTool] = useState<AnnotationTool | 'none'>(() => {
+    try {
+      const saved = localStorage.getItem('pdf_active_tool');
+      if (saved && ['draw', 'highlight', 'underline', 'note', 'text', 'rect', 'circle', 'arrow', 'eraser', 'select', 'none'].includes(saved)) {
+        return saved as AnnotationTool | 'none';
+      }
+    } catch (e) {
+      console.warn('Could not load pdf_active_tool:', e);
+    }
+    return 'draw';
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('pdf_active_tool', activeTool);
+    } catch (e) {
+      console.warn('Could not save pdf_active_tool:', e);
+    }
+  }, [activeTool]);
 
   // Custom Dynamic Drag-Scroll Speed (0.5x to 4.0x)
   const [scrollSpeed, setScrollSpeed] = useState<number>(() => {
@@ -1566,29 +1584,132 @@ export const PdfEditor: React.FC<PdfEditorProps> = ({
   };
 
   // Pen settings
-  const [penColor, setPenColor] = useState<string>('#dc2626');
-  const [penWidth, setPenWidth] = useState<number>(3); // 1px to 12px
+  const [penColor, setPenColor] = useState<string>(() => {
+    try {
+      return localStorage.getItem('pdf_pen_color') || '#dc2626';
+    } catch (e) {
+      return '#dc2626';
+    }
+  });
+  const [penWidth, setPenWidth] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem('pdf_pen_width');
+      return saved ? parseFloat(saved) : 3;
+    } catch (e) {
+      return 3;
+    }
+  });
   const [showPenPopover, setShowPenPopover] = useState<boolean>(false);
 
+  useEffect(() => {
+    try {
+      localStorage.setItem('pdf_pen_color', penColor);
+      localStorage.setItem('pdf_pen_width', penWidth.toString());
+    } catch (e) {}
+  }, [penColor, penWidth]);
+
   // Highlight settings (Default is highest strength: Level 15 / 0.95)
-  const [highlightColor, setHighlightColor] = useState<string>('#facc15');
-  const [highlightStrength, setHighlightStrength] = useState<number>(0.95); // Default Level 15 (0.95)
-  const [highlightWidth, setHighlightWidth] = useState<number>(3.2); // 2 to 8.5
-  const [highlightMode, setHighlightMode] = useState<'fixed' | 'variable'>('fixed'); // 'fixed' = straight line, 'variable' = freehand cursor follow
+  const [highlightColor, setHighlightColor] = useState<string>(() => {
+    try {
+      return localStorage.getItem('pdf_highlight_color') || '#facc15';
+    } catch (e) {
+      return '#facc15';
+    }
+  });
+  const [highlightStrength, setHighlightStrength] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem('pdf_highlight_strength');
+      return saved ? parseFloat(saved) : 0.95;
+    } catch (e) {
+      return 0.95;
+    }
+  });
+  const [highlightWidth, setHighlightWidth] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem('pdf_highlight_width');
+      return saved ? parseFloat(saved) : 3.2;
+    } catch (e) {
+      return 3.2;
+    }
+  });
+  const [highlightMode, setHighlightMode] = useState<'fixed' | 'variable'>(() => {
+    try {
+      const saved = localStorage.getItem('pdf_highlight_mode');
+      return saved === 'variable' ? 'variable' : 'fixed';
+    } catch (e) {
+      return 'fixed';
+    }
+  });
   const [showHighlightPopover, setShowHighlightPopover] = useState<boolean>(false);
 
+  useEffect(() => {
+    try {
+      localStorage.setItem('pdf_highlight_color', highlightColor);
+      localStorage.setItem('pdf_highlight_strength', highlightStrength.toString());
+      localStorage.setItem('pdf_highlight_width', highlightWidth.toString());
+      localStorage.setItem('pdf_highlight_mode', highlightMode);
+    } catch (e) {}
+  }, [highlightColor, highlightStrength, highlightWidth, highlightMode]);
+
   // Underline settings
-  const [underlineColor, setUnderlineColor] = useState<string>('#dc2626');
-  const [underlineWidth, setUnderlineWidth] = useState<number>(2); // 1px to 8px
+  const [underlineColor, setUnderlineColor] = useState<string>(() => {
+    try {
+      return localStorage.getItem('pdf_underline_color') || '#dc2626';
+    } catch (e) {
+      return '#dc2626';
+    }
+  });
+  const [underlineWidth, setUnderlineWidth] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem('pdf_underline_width');
+      return saved ? parseFloat(saved) : 2;
+    } catch (e) {
+      return 2;
+    }
+  });
   const [showUnderlinePopover, setShowUnderlinePopover] = useState<boolean>(false);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('pdf_underline_color', underlineColor);
+      localStorage.setItem('pdf_underline_width', underlineWidth.toString());
+    } catch (e) {}
+  }, [underlineColor, underlineWidth]);
 
   // Note settings
   const [noteColor, setNoteColor] = useState<string>('#38bdf8');
   const [noteFontSize, setNoteFontSize] = useState<number>(14);
 
   // General drawing color
-  const [selectedColor, setSelectedColor] = useState<string>('#dc2626');
-  const [strokeWidth, setStrokeWidth] = useState<number>(3);
+  const [selectedColor, setSelectedColor] = useState<string>(() => {
+    try {
+      const tool = localStorage.getItem('pdf_active_tool');
+      if (tool === 'highlight') {
+        return localStorage.getItem('pdf_highlight_color') || '#facc15';
+      } else if (tool === 'underline') {
+        return localStorage.getItem('pdf_underline_color') || '#dc2626';
+      }
+      return localStorage.getItem('pdf_pen_color') || '#dc2626';
+    } catch (e) {
+      return '#dc2626';
+    }
+  });
+  const [strokeWidth, setStrokeWidth] = useState<number>(() => {
+    try {
+      const tool = localStorage.getItem('pdf_active_tool');
+      if (tool === 'highlight') {
+        const saved = localStorage.getItem('pdf_highlight_width');
+        return saved ? parseFloat(saved) : 3.2;
+      } else if (tool === 'underline') {
+        const saved = localStorage.getItem('pdf_underline_width');
+        return saved ? parseFloat(saved) : 2;
+      }
+      const saved = localStorage.getItem('pdf_pen_width');
+      return saved ? parseFloat(saved) : 3;
+    } catch (e) {
+      return 3;
+    }
+  });
 
   // Page dimension caching & virtualization
   const [defaultDimensions, setDefaultDimensions] = useState<{ width: number; height: number }>({ width: 595.28, height: 841.89 });
